@@ -2748,6 +2748,21 @@ private:
 		void lateCheck(void *controller);
 
 		/**
+		 *  Opt-in diagnostic (-igfxtgldiag). A bounded number of significant display transitions
+		 *  is reported by a separate kernel thread, never from the MMIO hook itself.
+		 *  No additional MMIO, filesystem, IORegistry, or NVRAM accesses are performed.
+		 */
+		bool diagnosticEnabled {false};
+		volatile uint32_t diagnosticBudget {24};
+		volatile uint32_t diagnosticSequence {0};
+		volatile uint32_t diagnosticStage {0};
+		volatile uint32_t diagnosticAddress {0};
+		volatile uint32_t diagnosticValue {0};
+		thread_call_t diagnosticCall {nullptr};
+		static void diagnosticThread(thread_call_param_t self, thread_call_param_t);
+		void noteDiagnostic(uint32_t stage, uint32_t address, uint32_t value);
+
+		/**
 		 *  Publishing runs on a kernel thread call: doing it inside the register hooks reset the machine (runs B and F3)
 		 */
 		thread_call_t publishCall {nullptr};
