@@ -8,6 +8,7 @@
 #ifndef kern_igfx_hpp
 #define kern_igfx_hpp
 
+#include <kern/thread_call.h>
 #include "kern_fb.hpp"
 #include "kern_igfx_lspcon.hpp"
 #include "kern_igfx_backlight.hpp"
@@ -2377,7 +2378,430 @@ private:
 		void processKernel(KernelPatcher &patcher, DeviceInfo *info) override;
 		void processFramebufferKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) override;
 	} modDisplayDataBufferEarlyOptimizer;
-	
+
+	/**
+	 *  A submodule to trace framebuffer MMIO register accesses on Tiger Lake and stop at a chosen one
+	 *
+	 *  @note Apple ships no Tiger Lake framebuffer. With `-igfxtgl`, the ICL LP framebuffer is routed on
+	 *        Tiger Lake so that its ReadRegister32/WriteRegister32 calls can be counted. `igfxtglstop=N`
+	 *        panics (or parks the thread with `-igfxtglpark`) before access N is performed, with the last
+	 *        accesses in the panic string. Bisecting N converts a silent platform reset into a named register.
+	 *  @note Only accesses routed through ReadRegister32/WriteRegister32 are seen. Inlined MMIO is invisible.
+	 */
+	class TigerLakeTracer: public PatchSubmodule {
+	public:
+		/**
+		 *  Number of recent accesses kept for the report
+		 */
+		static constexpr size_t RingSize = 32;
+
+		/**
+		 *  A single recorded register access
+		 */
+		struct Access {
+			uint32_t index;
+			uint32_t address;
+			uint32_t value;
+			bool write;
+		};
+
+		/**
+		 *  Ring buffer of recent accesses
+		 */
+		Access ring[RingSize] {};
+
+		/**
+		 *  Number of accesses seen so far (1-based index of the latest one)
+		 */
+		volatile SInt32 count {0};
+
+		/**
+		 *  Access index to stop before, 0 to never stop
+		 */
+		uint32_t stopAt {0};
+
+		/**
+		 *  Park the calling thread instead of panicking
+		 */
+		bool park {false};
+
+		/**
+		 *  Record an access that is about to be performed, stopping if requested
+		 *
+		 *  @return Ring slot of the access, used to fill in the value of a read after it completes
+		 */
+		size_t onAccess(bool write, uint32_t address, uint32_t value);
+
+		// MARK: Patch Submodule IMP
+		void init() override;
+		void processKernel(KernelPatcher &patcher, DeviceInfo *info) override;
+	} modTigerLakeTracer;
+
+	/**
+	 *  A submodule to self-test the Tiger Lake tracer and to trace early framebuffer functions at function granularity
+	 *
+	 *  @note Everything reports by panicking, because early IOLog output does not survive on the target machine.
+	 *        `-igfxtglalive` panics while the kernel is processed, proving this code runs at all.
+	 *        `-igfxtglselftest` panics with the hook status while the framebuffer kext is patched, before any of its code runs.
+	 *        `igfxtglfn=N` panics on the first entry to table function N (1-based), before calling it.
+	 *        `igfxtglfnret=N` panics after the first return of table function N. `igfxtglfn=0` routes and logs only.
+	 *  @note Register-level tracing is blind before the first hooked access and to the unhooked DMC upload in
+	 *        hwInitializeCState. Function-level tracing covers both.
+	 */
+	class TigerLakeFunctionTracer: public PatchSubmodule {
+	public:
+		/**
+		 *  A traced framebuffer function
+		 */
+		struct Function {
+			/**
+			 *  Mangled symbol name
+			 */
+			const char *symbol;
+
+			/**
+			 *  Short name used in logs and panic strings
+			 */
+			const char *name;
+
+			/**
+			 *  First bytes of the function in the audited binary (macOS 26.6 25G72). Any mismatch skips routing.
+			 */
+			uint8_t signature[16];
+
+			/**
+			 *  Number of bytes from the start that contain no relative operands, so a trampoline may copy them
+			 */
+			uint8_t safeLength;
+		};
+
+		/**
+		 *  Wrapper signature: every traced function takes at most six integer or pointer arguments
+		 *  and returns void, an integer, or a pointer, so passing six registers through is exact on x86_64
+		 */
+		using Wrapper = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
+		/**
+		 *  Maximum number of traced functions
+		 */
+		static constexpr size_t MaxFunctions = 32;
+
+		/**
+		 *  Traced functions, in start() call order
+		 */
+		static const Function functions[];
+
+		/**
+		 *  Number of traced functions
+		 */
+		static const size_t functionCount;
+
+		/**
+		 *  Wrappers, one per traced function
+		 */
+		static const Wrapper wrappers[];
+
+		/**
+		 *  Original functions (trampolines), null if not routed
+		 */
+		mach_vm_address_t org[MaxFunctions] {};
+
+		/**
+		 *  Number of entries to and returns from each function
+		 */
+		volatile SInt32 entries[MaxFunctions] {};
+		volatile SInt32 returns[MaxFunctions] {};
+
+		/**
+		 *  Per-function status reported by the self-test, one character each
+		 */
+		char status[MaxFunctions + 1] {};
+
+		/**
+		 *  Function to stop on entry to, and after the return of (1-based), 0 to never stop
+		 */
+		uint32_t stopEntry {0};
+		uint32_t stopReturn {0};
+
+		/**
+		 *  Route the traced functions
+		 */
+		bool routing {false};
+
+		/**
+		 *  Panic with the hook status once the framebuffer kext is patched
+		 */
+		bool selfTest {false};
+
+		/**
+		 *  Number of resolved and routed functions
+		 */
+		size_t resolved {0};
+		size_t routed {0};
+
+		/**
+		 *  Wrapper for traced function I
+		 */
+		template <size_t I>
+		static uint64_t wrapFunction(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
+
+		/**
+		 *  Called on entry to and after the return of traced function i, stopping if requested
+		 */
+		void onEntry(size_t i);
+		void onReturn(size_t i, uint64_t result);
+
+		/**
+		 *  Panic with a report followed by the register tracer's ring, oldest first
+		 */
+		[[noreturn]] void panicWithRing(const char *head);
+
+		// MARK: Patch Submodule IMP
+		void init() override;
+		void processKernel(KernelPatcher &patcher, DeviceInfo *info) override;
+		void processFramebufferKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) override;
+	} modTigerLakeFunctionTracer;
+
+	/**
+	 *  A submodule that lets the Ice Lake LP framebuffer drive Tiger Lake display hardware
+	 *
+	 *  @note Enabled by `-igfxtglmap` on a Tiger Lake CPU (the CPU generation may be overridden by `lilucpu=12`
+	 *        so that every Ice Lake fix in this kext stays available).
+	 *  @note The Gen11 driver programs registers that Gen12 moved or re-encoded. Each access that goes through
+	 *        ReadRegister32/WriteRegister32 is translated here. References are to Linux i915 (v6.6) `i915_reg.h`:
+	 *        - eDP transcoder: ICL has TRANSCODER_EDP at 0x6Fxxx/0x7Fxxx; TGL has none, eDP uses transcoder A (0x60xxx/0x70xxx).
+	 *        - DP_TP_CTL/STATUS: ICL per port (0x64040/0x64044); TGL per transcoder (0x60540/0x60544).
+	 *        - DDI_DP_COMP_CTL: ICL 0x640F0..; TGL 0x605F0..
+	 *        - TRANS_DDI_FUNC_CTL DDI select: ICL `port << 28`; TGL `(port + 1) << 27`.
+	 *        - TRANS_CLK_SEL: ICL `(port + 1) << 29`; TGL `(port + 1) << 28`, and required for eDP too.
+	 *        - Combo DPLL config: ICL 0x164000/0x164004 (+0x80); TGL 0x164284/0x164288 (+8). With a 38.4 MHz
+	 *          reference TGL wants half the DCO fraction (ehl_combo_pll_div_frac_wa_needed).
+	 *        - Enable order: TGL needs TRANS_CLK_SEL and the DDI select in TRANS_DDI_FUNC_CTL before DP_TP_CTL
+	 *          is enabled (tgl_ddi_pre_enable_dp steps 7.a-7.c). ICL enables DP_TP_CTL first, so those two writes
+	 *          are synthesized when the driver enables DP_TP_CTL on DDI A.
+	 */
+	class TigerLakeRegisterMap: public PatchSubmodule {
+	public:
+		/**
+		 *  Feature mask, `igfxtglmap=<mask>`. `-igfxtglmap` means every translation and no side effects (0x3F).
+		 *  Side effects (registry, NVRAM, logging) are opt-in: the first 0003 build did them unconditionally at the
+		 *  driver's first register access and that boot reset.
+		 */
+		enum Feature : uint32_t {
+			MapEdpTranscoder = 0x001,  // 0x6Fxxx/0x7Fxxx -> transcoder A
+			MapDpTp          = 0x002,  // DP_TP_CTL/STATUS, DDI_DP_COMP of DDI A -> transcoder A
+			XlateFuncCtl     = 0x004,  // TRANS_DDI_FUNC_CTL DDI select encoding
+			XlateClkSel      = 0x008,  // TRANS_CLK_SEL encoding
+			MapDpll          = 0x010,  // combo DPLL CFGCR0/1 addresses and DCO fraction
+			SynthPreEnable   = 0x020,  // TRANS_CLK_SEL + FUNC_CTL select before DP_TP_CTL enable, cleanup after disable
+			PublishRegistry  = 0x040,  // tgl-map-state property on the controller
+			PublishNVRAM     = 0x080,  // tgl-map-state NVRAM variable
+			Log              = 0x100,  // IOLog translated accesses
+			KeepBacklight    = 0x4000, // drop the driver's writes to BXT_BLC_PWM_FREQ1/DUTY1 (0xC8254/0xC8258) and restore the
+			                           // firmware's values if they were zero: run F5 showed the driver leaves the duty at 0
+			ScaleBacklight   = 0x8000, // brightness control: keep the firmware's PWM frequency, rescale the duty the driver writes
+			                           // (driver scale -> firmware scale) and never write a zero duty
+			LateState        = 0x2000, // snapshot the hardware at the first access and again igfxtglwait seconds (default 60) after the
+			                           // first DP_TP_CTL enable, and only then publish the record to NVRAM and the registry
+			EdpCoreOnly      = 0x800,  // with MapEdpTranscoder: map only timings/M-N (0x6F000-0x6F0FF), FUNC_CTL/MSA (0x6F400-0x6F41F)
+			                           // and the pipe config block (0x7F000-0x7F0FF); leave DIP, VRR and PSR registers unmapped
+			LazyEdpReads     = 0x400,  // with MapEdpTranscoder: map eDP reads only after the driver first writes to that block,
+			                           // so the driver's startup probing sees what it saw without the map
+			TraceDisk        = 0x10000, // diagnostic: once armed, every register access goes into a ring that is written
+			                            // synchronously to /Users/Shared/tgl-trace.bin, so a hard freeze leaves the
+			                            // driver's last accesses on disk. Armed by a zero backlight duty (brightness
+			                            // slider at minimum) or at igfxtgltraceat seconds of uptime; ends after 120 s.
+			                            // The file is never closed, so a clean shutdown hangs afterwards: power off by hand.
+			TraceNoWait      = 0x40000, // with TraceDisk: do not hold the driver until an access is on disk. The driver
+			                            // runs at its normal speed and the last millisecond or two may be lost.
+			AllTranslation   = 0x03F
+		};
+		uint32_t features {0};
+
+		/**
+		 *  Set once the driver has written to the eDP transcoder block (see LazyEdpReads)
+		 */
+		bool edpActivated {false};
+
+		/**
+		 *  True while DP_TP_CTL of DDI A is enabled (last value the driver wrote)
+		 */
+		bool ddiAActive {false};
+
+		/**
+		 *  Firmware backlight PWM frequency and duty, read at the first register access
+		 */
+		uint32_t fwBacklightFreq {0};
+		uint32_t fwBacklightDuty {0};
+
+		/**
+		 *  PWM frequency (= maximum duty) the driver believes it programmed, and the last duty written to the hardware
+		 */
+		uint32_t driverBacklightFreq {0};
+		uint32_t lastBacklightDuty {0};
+
+		/**
+		 *  The driver wrote a zero duty and has not set a level since
+		 */
+		bool backlightBlanked {false};
+
+		/**
+		 *  Highest backlight level AppleBacklight sends for the SSDT-PNLF _UID in use (igfxtglblmax, default 0xFFFF).
+		 *  The driver turns a level into duty = level * frequency / 0xFFFF, so with _UID 15 (0xAD9) the duty never
+		 *  exceeds 4 % unless the scale accounts for it.
+		 */
+		uint32_t backlightLevelMax {0xFFFF};
+
+		/**
+		 *  The duty the driver would write for the highest level: the denominator of the backlight scale
+		 */
+		uint32_t driverDutyMax() const {
+			uint32_t m = static_cast<uint32_t>((static_cast<uint64_t>(driverBacklightFreq) * backlightLevelMax) / 0xFFFF);
+			return m ? m : 1;
+		}
+		bool has(uint32_t f) const { return (features & f) != 0; }
+
+		/**
+		 *  Log every translated access (not only the first ones); needs the Log feature
+		 */
+		bool trace {false};
+
+		/**
+		 *  Leave the firmware's DPLL configuration alone: drop the driver's writes to the ICL DPLL config registers
+		 */
+		bool keepFirmwarePLL {false};
+
+		/**
+		 *  Firmware state captured at the first register access
+		 */
+		bool snapshotTaken {false};
+		uint32_t fwFuncCtlA {0};
+		uint32_t refIs38400 {0};
+
+		/**
+		 *  Last non-zero value the driver wrote to TRANS_DDI_FUNC_CTL of the eDP transcoder (ICL encoding)
+		 */
+		uint32_t lastEdpFuncCtl {0};
+
+		/**
+		 *  Remaining number of log lines when not tracing
+		 */
+		volatile SInt32 logBudget {600};
+
+		/**
+		 *  Remaining number of log lines for translated reads when not tracing (reads can be polled)
+		 */
+		volatile SInt32 readLogBudget {250};
+
+		/**
+		 *  State record published to the IORegistry (property `tgl-map-state` on the framebuffer controller) and to
+		 *  NVRAM (`4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:tgl-map-state`), because kext log output is not persisted on
+		 *  recent macOS and a failed attempt leaves a black screen. All fields are little-endian 32-bit words.
+		 */
+		struct State {
+			static constexpr uint32_t Magic = 0x324D4754; // "TGM2"
+			static constexpr uint32_t RingSize = 48;
+			uint32_t magic {Magic};
+			uint32_t seq {0};
+			uint32_t fw[21] {};         // firmware state at first access, see snapshot()
+			uint32_t mappedReads {0};
+			uint32_t mappedWrites {0};
+			uint32_t tpEnables {0};
+			uint32_t tpDisables {0};
+			uint32_t synthClkSel {0};
+			uint32_t synthFuncCtl {0};
+			uint32_t lastTpCtl {0};      // last DP_TP_CTL value written by the driver
+			uint32_t lastTpStatus {0};   // last DP_TP_STATUS value read
+			uint32_t orTpStatus {0};     // OR of every DP_TP_STATUS value read
+			uint32_t lastFuncCtlAddr {0};
+			uint32_t lastFuncCtlDriver {0};
+			uint32_t lastFuncCtlOut {0};
+			uint32_t lastConfAddr {0};
+			uint32_t lastConf {0};
+			uint32_t lastCfgcr0Addr {0};
+			uint32_t lastCfgcr0Driver {0};
+			uint32_t lastCfgcr0Out {0};
+			uint32_t lastCfgcr1Addr {0};
+			uint32_t lastCfgcr1Out {0};
+			uint32_t lastDdiBufCtl {0};
+			uint32_t lastDpll0Enable {0};
+			uint32_t lastDpll1Enable {0};
+			uint32_t lastDpclka {0};
+			uint32_t lastClkSelOut {0};
+			uint32_t now[14] {};        // live values when published, see publish()
+			uint32_t ringNext {0};
+			struct { uint32_t address; uint32_t value; } ring[RingSize] {}; // recent writes to DDI A / transcoder / PLL registers (bit 31 of address: translated)
+			static constexpr uint32_t SnapSize = 48;
+			uint32_t lateCount {0};       // number of late snapshots taken
+			uint32_t lateSeconds {0};     // seconds after the first DP_TP_CTL enable of the last one
+			uint32_t early[SnapSize] {};  // hardware at the driver's first register access (firmware state)
+			uint32_t late[SnapSize] {};   // hardware at the last late snapshot
+		} state;
+
+		/**
+		 *  Late snapshot bookkeeping
+		 */
+		uint64_t firstTpEnableTime {0};
+		uint32_t lateWait {60};
+		uint32_t lateTaken {0};
+		void takeSnapshot(void *controller, uint32_t *out);
+		void lateCheck(void *controller);
+
+		/**
+		 *  Publishing runs on a kernel thread call: doing it inside the register hooks reset the machine (runs B and F3)
+		 */
+		thread_call_t publishCall {nullptr};
+		static void publishThread(thread_call_param_t self, thread_call_param_t controller);
+
+		/**
+		 *  Register trace kept on disk (TraceDisk). Reads: bit 31 clear, value = number of consecutive reads of that
+		 *  address. Writes: bit 31 set, value = what the driver wrote (before translation).
+		 */
+		struct TraceRecord {
+			static constexpr uint32_t Magic = 0x52544754; // "TGTR"
+			static constexpr uint32_t RingSize = 500;
+			uint32_t magic {Magic};
+			uint32_t seq {0};       // bumped on every write access
+			uint32_t next {0};      // total entries recorded; the newest is ring[(next - 1) % RingSize]
+			uint32_t armedBy {0};   // 1 zero duty, 2 uptime
+			uint32_t flushes {0};
+			uint32_t waitTimeouts {0};
+			uint32_t armUptime {0}; // seconds
+			uint32_t nowUptime {0};
+			struct { uint32_t address; uint32_t value; } ring[RingSize] {};
+		} traceRec;
+		bool traceArmed {false};
+		bool traceDone {false};
+		uint32_t traceAt {0};
+		volatile uint32_t traceFlushed {0};
+		thread_call_t traceCall {nullptr};
+		void *traceVnode {nullptr};
+		void *traceContext {nullptr};
+		static void traceThread(thread_call_param_t self, thread_call_param_t);
+		void traceArm(uint32_t by);
+		void traceNote(uint32_t address, uint32_t value, bool isWrite);
+
+		/**
+		 *  Number of NVRAM publications left; the registry property is always updated
+		 */
+		uint32_t nvramBudget {10};
+
+		uint32_t read(void *controller, uint32_t address);
+		void write(void *controller, uint32_t address, uint32_t value);
+
+		// MARK: Patch Submodule IMP
+		void init() override;
+		void processKernel(KernelPatcher &patcher, DeviceInfo *info) override;
+
+	private:
+		void publish(void *controller, bool toNVRAM);
+		void record(uint32_t address, uint32_t value, bool translated);
+		void snapshot(void *controller);
+		void prepareTranscoderA(void *controller);
+		bool shouldLog(bool isRead = false);
+		uint32_t mapAddress(uint32_t address, bool isWrite) const;
+	} modTigerLakeRegisterMap;
+
 	/**
 	 *  A collection of shared submodules
 	 */
@@ -2390,7 +2814,7 @@ private:
 	/**
 	 *  A collection of submodules
 	 */
-	PatchSubmodule *submodules[21] = {
+	PatchSubmodule *submodules[24] = {
 		&modDVMTCalcFix,
 		&modDPCDMaxLinkRateFix,
 		&modCoreDisplayClockFix,
@@ -2412,6 +2836,9 @@ private:
 		&modFramebufferDebugSupport,
 		&modMaxPixelClockOverride,
 		&modDisplayDataBufferEarlyOptimizer,
+		&modTigerLakeTracer,
+		&modTigerLakeFunctionTracer,
+		&modTigerLakeRegisterMap,
 	};
 	
 	/**

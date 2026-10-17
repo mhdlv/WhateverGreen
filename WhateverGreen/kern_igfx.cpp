@@ -5,6 +5,7 @@
 //  Copyright © 2018 vit9696. All rights reserved.
 //
 
+#include <Headers/kern_nvram.hpp>
 #include "kern_igfx.hpp"
 #include "kern_fb.hpp"
 #include "kern_guc.hpp"
@@ -17,6 +18,9 @@
 #include <Headers/kern_iokit.hpp>
 
 #include <IOKit/pci/IOPCIDevice.h>
+#include <sys/vnode.h>
+#include <sys/uio.h>
+#include <sys/fcntl.h>
 
 IGFX *IGFX::callbackIGFX;
 
@@ -135,6 +139,14 @@ void IGFX::init() {
 			modRPSControlPatch.available = true;
 			modTypeCCheckDisabler.enabled = true;
 			modBlackScreenFix.available = true;
+			break;
+		case CPUInfo::CpuGeneration::TigerLake:
+			// Experimental and opt-in. There is no Tiger Lake driver; route the ICL LP framebuffer so that
+			// framebuffer patches and the MMIO tracer can act on it. The accelerator is deliberately left alone.
+			if (checkKernelArgument("-igfxtgl"))
+				currentFramebuffer = &kextIntelICLLPFb;
+			else
+				SYSLOG("igfx", "found an unsupported processor 0x%X:0x%X, please report this!", family, model);
 			break;
 		case CPUInfo::CpuGeneration::RocketLake:
 		case CPUInfo::CpuGeneration::AlderLake:
@@ -497,7 +509,12 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 	}
 	
 	// Invoke the original function
-	uint32_t retVal = callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32(controller, address);
+	auto &tracer = callbackIGFX->modTigerLakeTracer;
+	size_t slot = tracer.enabled ? tracer.onAccess(false, address, 0) : 0;
+	auto &regMap = callbackIGFX->modTigerLakeRegisterMap;
+	uint32_t retVal = regMap.enabled ? regMap.read(controller, address) : callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32(controller, address);
+	if (tracer.enabled)
+		tracer.ring[slot].value = retVal;
 	if (callbackIGFX->modMMIORegistersReadSupport.verbose)
 		DBGLOG("igfx", "RRS: Read MMIO Register = 0x%x; Value = 0x%x.", address, retVal);
 	
@@ -587,7 +604,12 @@ void IGFX::MMIORegistersWriteSupport::wrapWriteRegister32(void *controller, uint
 	}
 	
 	// Invoke the original function
-	callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32(controller, address, value);
+	if (callbackIGFX->modTigerLakeTracer.enabled)
+		callbackIGFX->modTigerLakeTracer.onAccess(true, address, value);
+	if (callbackIGFX->modTigerLakeRegisterMap.enabled)
+		callbackIGFX->modTigerLakeRegisterMap.write(controller, address, value);
+	else
+		callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32(controller, address, value);
 	if (callbackIGFX->modMMIORegistersWriteSupport.verbose)
 		DBGLOG("igfx", "RWS: Write MMIO Register = 0x%x; Value = 0x%x.", address, value);
 	
@@ -597,6 +619,824 @@ void IGFX::MMIORegistersWriteSupport::wrapWriteRegister32(void *controller, uint
 		DBGLOG("igfx", "RWS: Found a epilogue injector triggered by the register value 0x%x.", address);
 		return epilogueInjector(controller, address, value);
 	}
+}
+
+// MARK: - Tiger Lake MMIO Tracer
+
+void IGFX::TigerLakeTracer::init() {
+	// We rely on the shared MMIO read and write support to see every register access
+	requiresPatchingFramebuffer = true;
+	requiresMMIORegistersReadAccess = true;
+	requiresMMIORegistersWriteAccess = true;
+}
+
+void IGFX::TigerLakeTracer::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
+	enabled = BaseDeviceInfo::get().cpuGeneration == CPUInfo::CpuGeneration::TigerLake && checkKernelArgument("-igfxtgl");
+	if (!enabled)
+		return;
+
+	PE_parse_boot_argn("igfxtglstop", &stopAt, sizeof(stopAt));
+	park = checkKernelArgument("-igfxtglpark");
+	SYSLOG("igfx", "TGL: Tracing framebuffer MMIO. Will stop before access %u by %s.", stopAt, park ? "parking" : "panicking");
+}
+
+size_t IGFX::TigerLakeTracer::onAccess(bool write, uint32_t address, uint32_t value) {
+	auto index = static_cast<uint32_t>(OSIncrementAtomic(&count)) + 1;
+	size_t slot = index % RingSize;
+	ring[slot] = {index, address, value, write};
+	if (index != stopAt)
+		return slot;
+
+	// The chosen access is never performed. Report the history, oldest first, then stop here.
+	static char report[RingSize * 40 + 96];
+	size_t len = snprintf(report, sizeof(report), "igfx TGL: stopped before access %u (%s 0x%05X)\n", index, write ? "W" : "R", address);
+	for (size_t i = 1; i < RingSize && len < sizeof(report); i++) {
+		auto &access = ring[(index + i) % RingSize];
+		if (access.index == 0)
+			continue;
+		if (park)
+			SYSLOG("igfx", "TGL: %u %s 0x%05X = 0x%08X", access.index, access.write ? "W" : "R", access.address, access.value);
+		len += snprintf(report + len, sizeof(report) - len, "%u %s 0x%05X = 0x%08X\n", access.index, access.write ? "W" : "R", access.address, access.value);
+	}
+
+	if (park) {
+		SYSLOG("igfx", "TGL: Stopped before access %u (%s 0x%05X). Parking this thread.", index, write ? "W" : "R", address);
+		while (true)
+			IOSleep(1000);
+	}
+
+	PANIC("igfx", "%s", report);
+}
+
+// MARK: - Tiger Lake Function Tracer
+
+// Audited against AppleIntelICLLPGraphicsFramebuffer from macOS 26.6 (25G72), see results/analysis/SYMBOLS.md.
+// safeLength is the number of leading bytes with no relative operands; a trampoline may only copy those.
+const IGFX::TigerLakeFunctionTracer::Function IGFX::TigerLakeFunctionTracer::functions[] {
+	{"__ZN31AppleIntelFramebufferController5startEP9IOService", "AIFC::start", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xEC}, 23},
+	{"__ZN31AppleIntelFramebufferController20initInterruptServiceEv", "AIFC::initInterruptService", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50, 0x48, 0x89}, 35},
+	{"__Z14registerSysctlv", "registerSysctl", {0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x48, 0x89, 0x05, 0x01, 0x05, 0x07, 0x00, 0x48, 0x89, 0x05}, 6},
+	{"__ZN31AppleIntelFramebufferController16getOSInformationEv", "AIFC::getOSInformation", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x18, 0x48, 0x89, 0xFB}, 23},
+	{"__ZN31AppleIntelFramebufferController17registerWithAICPMEPv", "AIFC::registerWithAICPM", {0x55, 0x48, 0x89, 0xE5, 0x53, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x89, 0xF3, 0xBE, 0x98, 0x59, 0x14}, 17},
+	{"__ZN31AppleIntelFramebufferController13FBMemMgr_InitEv", "AIFC::FBMemMgr_Init", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xEC}, 32},
+	{"__ZN31AppleIntelFramebufferController11initCDClockEv", "AIFC::initCDClock", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x89, 0xFB, 0xBE, 0x04, 0x10}, 18},
+	{"__ZN14AppleIntelPort13allocatePortsEj", "AppleIntelPort::allocatePorts", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50, 0x48, 0x83}, 14},
+	{"__ZN19AppleIntelPowerWell4initEP31AppleIntelFramebufferController", "AppleIntelPowerWell::init", {0x55, 0x48, 0x89, 0xE5, 0x53, 0x50, 0x48, 0x89, 0xFB, 0x48, 0x89, 0x77, 0x10, 0x8A, 0x86, 0x20}, 24},
+	{"__ZN19AppleIntelPowerWell20probePowerWellsStateEv", "AppleIntelPowerWell::probePowerWellsState", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xEC}, 33},
+	{"__ZN19AppleIntelPowerWell19enableDisplayEngineEv", "AppleIntelPowerWell::enableDisplayEngine", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x89, 0xFB, 0x48, 0x8B, 0x7F}, 22},
+	{"__ZN21AppleIntelDisplayPath4initEj", "AppleIntelDisplayPath::init", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x10, 0x41, 0x89, 0xF6, 0x48, 0x89}, 23},
+	{"__ZN21AppleIntelFramebuffer4initEP31AppleIntelFramebufferControllerj", "AppleIntelFramebuffer::init", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x83, 0xEC, 0x10, 0x41}, 38},
+	{"__ZN31AppleIntelFramebufferController23initPlatformWorkaroundsEv", "AIFC::initPlatformWorkarounds", {0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x83, 0xBF, 0x9C, 0x0C, 0x00, 0x00, 0x00, 0x75, 0x0F, 0xB8}, 13},
+	{"__ZN31AppleIntelFramebufferController16setupBootDisplayEv", "AIFC::setupBootDisplay", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xEC}, 37},
+	{"__ZN31AppleIntelFramebufferController21hwSetPanelPowerConfigEj", "AIFC::hwSetPanelPowerConfig", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xFB, 0x89, 0xB7, 0x00, 0x0D, 0x00, 0x00}, 25},
+	{"__ZN31AppleIntelFramebufferController25hwInitializeLatencyValuesEv", "AIFC::hwInitializeLatencyValues", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xFB, 0xBE, 0x06, 0x00, 0x00, 0x00, 0x31}, 17},
+	{"__ZN31AppleIntelFramebufferController18hwInitializeCStateEv", "AIFC::hwInitializeCState", {0x83, 0xBF, 0x38, 0x0B, 0x00, 0x00, 0x01, 0x0F, 0x85, 0xBA, 0x00, 0x00, 0x00, 0x55, 0x48, 0x89}, 7},
+	{"__ZN31AppleIntelFramebufferController19hwSetupCursorMemoryEv", "AIFC::hwSetupCursorMemory", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50, 0x45, 0x31}, 25},
+	{"__ZN31AppleIntelFramebufferController13setupWorkLoopEP10IOWorkLoop", "AIFC::setupWorkLoop", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x49, 0x89, 0xF6, 0x48, 0x89}, 17},
+	{"__ZN31AppleIntelFramebufferController15initPMRegistersEv", "AIFC::initPMRegisters", {0xF6, 0x87, 0x20, 0x09, 0x00, 0x00, 0x01, 0x0F, 0x85, 0x2C, 0x0C, 0x00, 0x00, 0x55, 0x48, 0x89}, 7},
+	{"__ZN31AppleIntelFramebufferController20hwGetMemoryLayoutEFIEP21AppleIntelFramebuffer", "AIFC::hwGetMemoryLayoutEFI", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x8B, 0x8E, 0x9C, 0x7D, 0x00}, 34},
+	{"__ZN14AppleIntelPAVP4initEP9IOService", "AppleIntelPAVP::init", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x49, 0x89, 0xF6, 0x48, 0x89, 0xFB, 0x48, 0x8D, 0x05}, 13},
+	{"__ZN31AppleIntelFramebufferController15createMEIDriverEv", "AIFC::createMEIDriver", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x45, 0x31, 0xFF, 0x48, 0x83, 0xBF}, 21},
+	{"__ZN31AppleIntelFramebufferController35createAppleGraphicsDeviceControlnubEv", "AIFC::createAppleGraphicsDeviceControlnub", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x49, 0x89, 0xFE, 0x48, 0x8B, 0x05}, 13},
+	{"__ZN31AppleIntelFramebufferController17addPMNotificationEv", "AIFC::addPMNotification", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x81, 0xEC, 0x28, 0x01, 0x00, 0x00}, 19},
+	{"__ZN31AppleIntelFramebufferController18hwEnableInterruptsEv", "AIFC::hwEnableInterrupts", {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x89, 0xFB, 0xBE, 0x08, 0x44}, 18},
+};
+
+const size_t IGFX::TigerLakeFunctionTracer::functionCount = arrsize(functions);
+
+template <size_t I>
+uint64_t IGFX::TigerLakeFunctionTracer::wrapFunction(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+	auto &tracer = callbackIGFX->modTigerLakeFunctionTracer;
+	tracer.onEntry(I);
+	auto result = reinterpret_cast<Wrapper>(tracer.org[I])(a0, a1, a2, a3, a4, a5);
+	tracer.onReturn(I, result);
+	return result;
+}
+
+const IGFX::TigerLakeFunctionTracer::Wrapper IGFX::TigerLakeFunctionTracer::wrappers[] {
+	wrapFunction<0>,
+	wrapFunction<1>,
+	wrapFunction<2>,
+	wrapFunction<3>,
+	wrapFunction<4>,
+	wrapFunction<5>,
+	wrapFunction<6>,
+	wrapFunction<7>,
+	wrapFunction<8>,
+	wrapFunction<9>,
+	wrapFunction<10>,
+	wrapFunction<11>,
+	wrapFunction<12>,
+	wrapFunction<13>,
+	wrapFunction<14>,
+	wrapFunction<15>,
+	wrapFunction<16>,
+	wrapFunction<17>,
+	wrapFunction<18>,
+	wrapFunction<19>,
+	wrapFunction<20>,
+	wrapFunction<21>,
+	wrapFunction<22>,
+	wrapFunction<23>,
+	wrapFunction<24>,
+	wrapFunction<25>,
+	wrapFunction<26>
+};
+
+void IGFX::TigerLakeFunctionTracer::init() {
+	static_assert(arrsize(wrappers) == arrsize(functions), "One wrapper per traced function");
+	static_assert(arrsize(functions) <= MaxFunctions, "Too many traced functions");
+
+	// We only need to patch the framebuffer driver
+	requiresPatchingFramebuffer = true;
+}
+
+void IGFX::TigerLakeFunctionTracer::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
+	if (!checkKernelArgument("-igfxtgl"))
+		return;
+
+	// Proves that this code runs at all and shows what the routing decided. Deliberately not limited to Tiger Lake.
+	auto &tracer = callbackIGFX->modTigerLakeTracer;
+	if (checkKernelArgument("-igfxtglalive"))
+		PANIC("igfx", "TGL: alive 0002 gen=%d fb=%d tracer=%d stop=%u park=%d vesa=%d", static_cast<int>(BaseDeviceInfo::get().cpuGeneration),
+			  callbackIGFX->currentFramebuffer == &kextIntelICLLPFb, tracer.enabled, tracer.stopAt, tracer.park, checkKernelArgument("-igfxvesa"));
+
+	if (BaseDeviceInfo::get().cpuGeneration != CPUInfo::CpuGeneration::TigerLake)
+		return;
+
+	selfTest = checkKernelArgument("-igfxtglselftest");
+	bool hasEntry = PE_parse_boot_argn("igfxtglfn", &stopEntry, sizeof(stopEntry));
+	bool hasReturn = PE_parse_boot_argn("igfxtglfnret", &stopReturn, sizeof(stopReturn));
+	routing = hasEntry || hasReturn;
+	enabled = selfTest || routing;
+	if (enabled)
+		SYSLOG("igfx", "TGL: fn tracer 0002 selftest=%d routing=%d entry=%u ret=%u", selfTest, routing, stopEntry, stopReturn);
+}
+
+void IGFX::TigerLakeFunctionTracer::processFramebufferKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	// WhateverGreen routes getOSInformation itself after all submodules when any of these is set, and the DVMT fix
+	// routes FBMemMgr_Init before us. Routing either again would stack two trampolines, so leave them alone.
+	auto igfx = callbackIGFX;
+	bool coreRoutesOSInformation = igfx->applyFramebufferPatch || igfx->dumpFramebufferToDisk || igfx->dumpPlatformTable || igfx->hdmiAutopatch;
+
+	for (size_t i = 0; i < functionCount; i++) {
+		auto &function = functions[i];
+		auto from = patcher.solveSymbol(index, function.symbol, address, size, true);
+		if (!from) {
+			patcher.clearError();
+			status[i] = '-';
+			continue;
+		}
+		resolved++;
+
+		if (memcmp(reinterpret_cast<const void *>(from), function.signature, sizeof(function.signature)) != 0) {
+			status[i] = 's';
+			continue;
+		}
+
+		if ((coreRoutesOSInformation && strcmp(function.symbol, "__ZN31AppleIntelFramebufferController16getOSInformationEv") == 0) ||
+			(igfx->modDVMTCalcFix.enabled && strcmp(function.symbol, "__ZN31AppleIntelFramebufferController13FBMemMgr_InitEv") == 0)) {
+			status[i] = 'w';
+			continue;
+		}
+
+		if (!routing) {
+			status[i] = 'r';
+			continue;
+		}
+
+		// A long (absolute) route overwrites 14 bytes. When fewer leading bytes are relocatable, only allow a short
+		// relative route, which overwrites 5 and fails cleanly when the wrapper is out of range.
+		bool shortOnly = function.safeLength < 14;
+		size_t copied = Disassembler::quickInstructionSize(from, shortOnly ? 5 : 14);
+		if (copied == 0 || copied > function.safeLength) {
+			status[i] = 'd';
+			continue;
+		}
+
+		KernelPatcher::RouteRequest request(function.symbol, wrappers[i], org[i]);
+		bool success = shortOnly ? patcher.routeMultipleShort(index, &request, 1, address, size) : patcher.routeMultiple(index, &request, 1, address, size);
+		if (!success || !org[i]) {
+			patcher.clearError();
+			org[i] = 0;
+			status[i] = 'f';
+			continue;
+		}
+
+		status[i] = '+';
+		routed++;
+	}
+	status[functionCount] = '\0';
+
+	for (size_t i = 0; i < functionCount; i++)
+		SYSLOG("igfx", "TGL: fn %lu %c %s", i + 1, status[i], functions[i].name);
+	SYSLOG("igfx", "TGL: fn table resolved %lu/%lu routed %lu: %s", resolved, functionCount, routed, status);
+
+	if (selfTest) {
+		auto &rrs = igfx->modMMIORegistersReadSupport;
+		auto &rws = igfx->modMMIORegistersWriteSupport;
+		auto &tracer = igfx->modTigerLakeTracer;
+		PANIC("igfx", "TGL: selftest 0002 kext=%d rrs=%d rws=%d orgR=%d orgW=%d tracer=%d stop=%u park=%d fn=%d entry=%u ret=%u resolved=%lu/%lu routed=%lu table=%s",
+			  igfx->getRealFramebuffer(index) == &kextIntelICLLPFb, rrs.enabled, rws.enabled, rrs.orgReadRegister32 != nullptr, rws.orgWriteRegister32 != nullptr,
+			  tracer.enabled, tracer.stopAt, tracer.park, routing, stopEntry, stopReturn, resolved, functionCount, routed, status);
+	}
+}
+
+void IGFX::TigerLakeFunctionTracer::onEntry(size_t i) {
+	auto hit = static_cast<uint32_t>(OSIncrementAtomic(&entries[i])) + 1;
+	auto access = static_cast<uint32_t>(callbackIGFX->modTigerLakeTracer.count);
+	SYSLOG("igfx", "TGL: fn > %lu %s hit %u access %u", i + 1, functions[i].name, hit, access);
+	if (hit != 1 || stopEntry != i + 1)
+		return;
+
+	static char head[160];
+	snprintf(head, sizeof(head), "igfx TGL: fn stopped on entry %lu/%lu %s (access %u, tracer %d)\n",
+			 i + 1, functionCount, functions[i].name, access, callbackIGFX->modTigerLakeTracer.enabled);
+	panicWithRing(head);
+}
+
+void IGFX::TigerLakeFunctionTracer::onReturn(size_t i, uint64_t result) {
+	auto hit = static_cast<uint32_t>(OSIncrementAtomic(&returns[i])) + 1;
+	auto access = static_cast<uint32_t>(callbackIGFX->modTigerLakeTracer.count);
+	SYSLOG("igfx", "TGL: fn < %lu %s hit %u access %u = 0x%llx", i + 1, functions[i].name, hit, access, result);
+	if (hit != 1 || stopReturn != i + 1)
+		return;
+
+	static char head[192];
+	snprintf(head, sizeof(head), "igfx TGL: fn stopped after return %lu/%lu %s = 0x%llx (access %u, tracer %d)\n",
+			 i + 1, functionCount, functions[i].name, result, access, callbackIGFX->modTigerLakeTracer.enabled);
+	panicWithRing(head);
+}
+
+void IGFX::TigerLakeFunctionTracer::panicWithRing(const char *head) {
+	// Same ring line format as the register tracer, so the harness can read both
+	auto &tracer = callbackIGFX->modTigerLakeTracer;
+	static char report[TigerLakeTracer::RingSize * 40 + 256];
+	size_t len = snprintf(report, sizeof(report), "%s", head);
+	auto latest = static_cast<uint32_t>(tracer.count);
+	for (uint32_t k = latest >= TigerLakeTracer::RingSize ? latest - TigerLakeTracer::RingSize + 1 : 1; k <= latest && len < sizeof(report); k++) {
+		auto &access = tracer.ring[k % TigerLakeTracer::RingSize];
+		if (access.index != k)
+			continue;
+		len += snprintf(report + len, sizeof(report) - len, "%u %s 0x%05X = 0x%08X\n", access.index, access.write ? "W" : "R", access.address, access.value);
+	}
+	PANIC("igfx", "%s", report);
+}
+
+// MARK: - Tiger Lake Register Map
+
+namespace TGLReg {
+	static constexpr uint32_t TransDdiFuncCtlA = 0x60400;
+	static constexpr uint32_t TransDdiFuncCtlB = 0x61400;
+	static constexpr uint32_t TransDdiFuncCtlC = 0x62400;
+	static constexpr uint32_t TransDdiFuncCtlEdpICL = 0x6F400;
+	static constexpr uint32_t TransConfA = 0x70008;
+	static constexpr uint32_t TransClkSelA = 0x46140;
+	static constexpr uint32_t TransClkSelC = 0x46148;
+	static constexpr uint32_t DpTpCtlA_ICL = 0x64040;
+	static constexpr uint32_t DpTpCtlA_TGL = 0x60540;
+	static constexpr uint32_t DdiBufCtlA = 0x64000;
+	static constexpr uint32_t Dpll0Cfgcr0_TGL = 0x164284;
+	static constexpr uint32_t Dpll0Cfgcr1_TGL = 0x164288;
+	static constexpr uint32_t Dpll1Cfgcr0_TGL = 0x16428C;
+	static constexpr uint32_t Dpll1Cfgcr1_TGL = 0x164290;
+	static constexpr uint32_t Dssm = 0x51004;
+	static constexpr uint32_t Enable = 0x80000000;
+	static constexpr uint32_t ModeDpSst = 2U << 24;
+	static constexpr uint32_t ModeMask = 7U << 24;
+	static constexpr uint32_t PortWidthMask = 7U << 1;
+	static constexpr uint32_t DcoFractionMask = 0x7FFFU << 10;
+
+	static inline bool isFuncCtl(uint32_t a) { return a == TransDdiFuncCtlA || a == TransDdiFuncCtlB || a == TransDdiFuncCtlC; }
+	static inline bool isClkSel(uint32_t a) { return a >= TransClkSelA && a <= TransClkSelC && (a & 3) == 0; }
+	static inline bool isCfgcr0(uint32_t a) { return a == Dpll0Cfgcr0_TGL || a == Dpll1Cfgcr0_TGL; }
+
+	// TRANS_DDI_FUNC_CTL: ICL selects the DDI with `port << 28` (3 bits), TGL with `(port + 1) << 27` (4 bits)
+	static inline uint32_t funcCtlToTGL(uint32_t v) {
+		if (v == 0)
+			return 0;
+		uint32_t port = (v >> 28) & 7;
+		return (v & ~(0xFU << 27)) | ((port + 1) << 27);
+	}
+	static inline uint32_t funcCtlToICL(uint32_t v) {
+		uint32_t select = (v >> 27) & 0xF;
+		return (v & ~(0xFU << 27)) | ((select ? select - 1 : 0) << 28);
+	}
+	// TRANS_CLK_SEL: ICL `(port + 1) << 29`, TGL `(port + 1) << 28`
+	static inline uint32_t clkSelToTGL(uint32_t v) { return ((v >> 29) & 7) << 28; }
+	static inline uint32_t clkSelToICL(uint32_t v) { return ((v >> 28) & 7) << 29; }
+	static inline uint32_t halveFraction(uint32_t v) {
+		uint32_t f = (v & DcoFractionMask) >> 10;
+		return (v & ~DcoFractionMask) | (((f + 1) / 2) << 10);
+	}
+	static inline uint32_t doubleFraction(uint32_t v) {
+		uint32_t f = ((v & DcoFractionMask) >> 10) * 2;
+		return (v & ~DcoFractionMask) | ((f > 0x7FFF ? 0x7FFF : f) << 10);
+	}
+}
+
+void IGFX::TigerLakeRegisterMap::init() {
+	requiresPatchingFramebuffer = true;
+	requiresMMIORegistersReadAccess = true;
+	requiresMMIORegistersWriteAccess = true;
+}
+
+void IGFX::TigerLakeRegisterMap::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
+	uint32_t mask = 0;
+	if (!PE_parse_boot_argn("igfxtglmap", &mask, sizeof(mask)))
+		mask = checkKernelArgument("-igfxtglmap") ? AllTranslation : 0;
+	if (mask == 0)
+		return;
+
+	uint32_t levelMax = 0;
+	if (PE_parse_boot_argn("igfxtglblmax", &levelMax, sizeof(levelMax)) && levelMax != 0 && levelMax <= 0xFFFF)
+		backlightLevelMax = levelMax;
+
+	// The generation may have been overridden with lilucpu, so look at the real CPU model
+	auto model = BaseDeviceInfo::get().cpuModel;
+	if (model != 0x8C && model != 0x8D) {
+		SYSLOG("igfx", "TGLMAP: igfxtglmap ignored, CPU model 0x%X is not Tiger Lake.", model);
+		return;
+	}
+
+	enabled = true;
+	features = mask;
+	trace = has(Log) && checkKernelArgument("-igfxtgltrace");
+	PE_parse_boot_argn("igfxtglwait", &lateWait, sizeof(lateWait));
+	if (has(LateState))
+		publishCall = thread_call_allocate(publishThread, this);
+	if (has(TraceDisk)) {
+		traceCall = thread_call_allocate(traceThread, this);
+		PE_parse_boot_argn("igfxtgltraceat", &traceAt, sizeof(traceAt));
+	}
+	keepFirmwarePLL = checkKernelArgument("-igfxtglfwpll");
+	SYSLOG("igfx", "TGLMAP: Translating Ice Lake display registers for Tiger Lake (features 0x%X, fwpll %d).", features, keepFirmwarePLL);
+}
+
+bool IGFX::TigerLakeRegisterMap::shouldLog(bool isRead) {
+	// IOLog may block: only when asked for, and never with interrupts disabled
+	if (!has(Log) || !ml_get_interrupts_enabled())
+		return false;
+	if (trace)
+		return true;
+	auto &budget = isRead ? readLogBudget : logBudget;
+	if (budget <= 0)
+		return false;
+	OSDecrementAtomic(&budget);
+	return true;
+}
+
+uint32_t IGFX::TigerLakeRegisterMap::mapAddress(uint32_t address, bool isWrite) const {
+	// eDP transcoder and its pipe configuration block -> transcoder A
+	if (has(MapEdpTranscoder) && ((address >= 0x6F000 && address <= 0x6FFFF) || (address >= 0x7F000 && address <= 0x7FFFF))) {
+		bool core = (address >= 0x6F000 && address <= 0x6F0FF) || (address >= 0x6F400 && address <= 0x6F41F) || (address >= 0x7F000 && address <= 0x7F0FF);
+		if (has(EdpCoreOnly) && !core)
+			return address;
+		if (isWrite || !has(LazyEdpReads) || edpActivated)
+			return address - 0xF000;
+		return address;
+	}
+	if (has(MapDpTp)) {
+		// DP_TP_CTL / DP_TP_STATUS of DDI A -> transcoder A
+		if (address == 0x64040 || address == 0x64044)
+			return address - 0x64040 + 0x60540;
+		// DDI_DP_COMP_CTL / PAT of DDI A -> transcoder A
+		if (address >= 0x640F0 && address <= 0x640FC)
+			return address - 0x640F0 + 0x605F0;
+	}
+	// Combo DPLL configuration
+	if (has(MapDpll)) {
+		switch (address) {
+			case 0x164000: return TGLReg::Dpll0Cfgcr0_TGL;
+			case 0x164004: return TGLReg::Dpll0Cfgcr1_TGL;
+			case 0x164080: return TGLReg::Dpll1Cfgcr0_TGL;
+			case 0x164084: return TGLReg::Dpll1Cfgcr1_TGL;
+			default: break;
+		}
+	}
+	return address;
+}
+
+void IGFX::TigerLakeRegisterMap::record(uint32_t address, uint32_t value, bool translated) {
+	auto &slot = state.ring[state.ringNext % State::RingSize];
+	slot.address = address | (translated ? 0x80000000U : 0);
+	slot.value = value;
+	state.ringNext++;
+}
+
+void IGFX::TigerLakeRegisterMap::publish(void *controller, bool toNVRAM) {
+	// Registry and NVRAM calls may block: only when asked for, and never from a context with interrupts disabled
+	if (!has(PublishRegistry | PublishNVRAM) || !ml_get_interrupts_enabled())
+		return;
+
+	static const uint32_t live[] = {
+		TGLReg::TransDdiFuncCtlA, TGLReg::TransClkSelA, TGLReg::TransConfA, TGLReg::DpTpCtlA_TGL, TGLReg::DpTpCtlA_TGL + 4, TGLReg::DdiBufCtlA,
+		0x46010, TGLReg::Dpll0Cfgcr0_TGL, 0x46014, TGLReg::Dpll1Cfgcr0_TGL, 0x164280, 0xC7200, 0xC7204, 0xC8250
+	};
+	static_assert(sizeof(live) == sizeof(State::now), "live snapshot size");
+	for (size_t i = 0; i < arrsize(live); i++)
+		state.now[i] = callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32(controller, live[i]);
+	state.seq++;
+
+	if (has(PublishRegistry))
+		static_cast<IOService *>(controller)->setProperty("tgl-map-state", &state, sizeof(state));
+
+	if (toNVRAM && has(PublishNVRAM) && nvramBudget > 0) {
+		nvramBudget--;
+		NVStorage storage;
+		if (storage.init()) {
+			storage.write(NVRAM_PREFIX(LILU_VENDOR_GUID, "tgl-map-state"), reinterpret_cast<const uint8_t *>(&state), sizeof(state), NVStorage::OptRaw);
+			storage.sync();
+			storage.deinit();
+		}
+	}
+}
+
+void IGFX::TigerLakeRegisterMap::snapshot(void *controller) {
+	snapshotTaken = true;
+	auto rd = callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32;
+
+	// Always needed: the firmware's transcoder A setup and the DPLL reference clock
+	fwFuncCtlA = rd(controller, TGLReg::TransDdiFuncCtlA);
+	refIs38400 = ((rd(controller, TGLReg::Dssm) >> 29) & 7) == 2;
+	fwBacklightFreq = rd(controller, 0xC8254);
+	fwBacklightDuty = rd(controller, 0xC8258);
+	// The driver never writes BXT_BLC_PWM_FREQ1 when it adopts the firmware's mode without a full modeset, so its scale
+	// cannot be learned from a write. AppleIntelFramebufferController::start picks it from SFUSE_STRAP bit 8:
+	// 0x56CE when set, 0x4571 when clear, and hwSetBacklight computes duty = level * that / 65535.
+	if (has(ScaleBacklight) && driverBacklightFreq == 0)
+		driverBacklightFreq = (rd(controller, 0xC2014) & (1U << 8)) ? 0x56CE : 0x4571;
+	if (has(LateState))
+		takeSnapshot(controller, state.early);
+	if (!has(PublishRegistry | PublishNVRAM))
+		return;
+
+	static const uint32_t regs[] = {
+		TGLReg::TransDdiFuncCtlA, TGLReg::TransClkSelA, TGLReg::TransConfA, TGLReg::DpTpCtlA_TGL, TGLReg::DpTpCtlA_TGL + 4, TGLReg::DdiBufCtlA,
+		0x46010, TGLReg::Dpll0Cfgcr0_TGL, TGLReg::Dpll0Cfgcr1_TGL, 0x46014, TGLReg::Dpll1Cfgcr0_TGL, TGLReg::Dpll1Cfgcr1_TGL, 0x164280, TGLReg::Dssm,
+		0x60000, 0x6000C, 0x6001C, 0x45404, 0x45444, 0x45454, 0x46000
+	};
+	static_assert(sizeof(regs) == sizeof(State::fw), "firmware snapshot size");
+	for (size_t i = 0; i < arrsize(regs); i++)
+		state.fw[i] = rd(controller, regs[i]);
+	publish(controller, true);
+}
+
+// Registers captured by the early and late snapshots (Tiger Lake addresses, read directly)
+static const uint32_t tglSnapshotRegisters[] = {
+	0x70008, 0x60400, 0x46140, 0x60540, 0x60544, 0x64000, 0x60000, 0x6000C,   // TRANS_CONF_A FUNC_CTL_A CLK_SEL_A DP_TP_CTL DP_TP_STATUS DDI_BUF_CTL HTOTAL VTOTAL
+	0x6001C, 0x60030, 0x60040, 0x70030, 0x70040, 0x70000, 0x70180, 0x70188,   // PIPESRC DATAM1 LINKM1 PIPE_MISC FRMCOUNT SCANLINE PLANE_CTL_1A STRIDE
+	0x7018C, 0x70190, 0x7019C, 0x7027C, 0x70240, 0x70080, 0x7017C, 0x45008,   // POS SIZE SURF PLANE_BUF_CFG PLANE_WM0 CURCNTR CUR_BUF_CFG DBUF_CTL_S1
+	0x44FE8, 0x45404, 0x45504, 0x46010, 0x164284, 0x164288, 0x164280, 0xC7200, // DBUF_CTL_S2 PWR_WELL_CTL2 DC_STATE_EN DPLL0_EN CFGCR0 CFGCR1 DPCLKA PP_STATUS
+	0xC7204, 0xC8250, 0xC8254, 0xC8258, 0x60800, 0x60840, 0x44400, 0x44404,   // PP_CONTROL BLC_CTL BLC_FREQ BLC_DUTY PSR_CTL PSR_STATUS DE_PIPE_ISR_A DE_PIPE_IMR_A
+	0x6F400, 0x7F008, 0x68080, 0x70034, 0x4A480, 0x4A400, 0x46000, 0x70040    // (ICL eDP FUNC_CTL, CONF as TGL returns them) PF_CTL_A PIPE_MISC2 GAMMA_MODE_A CSC_MODE? CDCLK FRMCOUNT again
+};
+
+void IGFX::TigerLakeRegisterMap::takeSnapshot(void *controller, uint32_t *out) {
+	static_assert(sizeof(tglSnapshotRegisters) == sizeof(State::early), "snapshot size");
+	auto rd = callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32;
+	for (size_t i = 0; i < arrsize(tglSnapshotRegisters); i++)
+		out[i] = rd(controller, tglSnapshotRegisters[i]);
+}
+
+void IGFX::TigerLakeRegisterMap::publishThread(thread_call_param_t param0, thread_call_param_t param1) {
+	// Kernel thread context, no driver locks held. The record goes to a file: NVRAM writes and setProperty were
+	// present in every run that reset when publishing (B, F3, F4), so neither is used here.
+	auto self = static_cast<TigerLakeRegisterMap *>(param0);
+	FileIO::writeBufferToFile("/Users/Shared/tgl-map-state.bin", &self->state, sizeof(self->state));
+}
+
+static uint32_t tglUptimeSeconds() {
+	uint64_t t = 0, nanos = 0;
+	clock_get_uptime(&t);
+	absolutetime_to_nanoseconds(t, &nanos);
+	return static_cast<uint32_t>(nanos / 1000000000ULL);
+}
+
+void IGFX::TigerLakeRegisterMap::traceThread(thread_call_param_t param0, thread_call_param_t) {
+	// Kernel thread context. One synchronous write of the whole record at offset 0.
+	auto self = static_cast<TigerLakeRegisterMap *>(param0);
+	uint32_t seq = self->traceRec.seq;
+	if (!self->traceContext)
+		self->traceContext = vfs_context_create(nullptr);
+	auto ctx = static_cast<vfs_context_t>(self->traceContext);
+	if (!self->traceVnode && ctx) {
+		vnode_t vp = NULLVP;
+		if (vnode_open("/Users/Shared/tgl-trace.bin", O_WRONLY | O_CREAT, 0666, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) == 0)
+			self->traceVnode = vp;
+	}
+	if (self->traceVnode && ctx) {
+		self->traceRec.flushes++;
+		self->traceRec.nowUptime = tglUptimeSeconds();
+		// The uio is not freed: uio_free is not among the symbols this kext is known to link against, and the
+		// trace runs for two minutes at most.
+		uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
+		if (uio) {
+			uio_addiov(uio, CAST_USER_ADDR_T(&self->traceRec), sizeof(self->traceRec));
+			VNOP_WRITE(static_cast<vnode_t>(self->traceVnode), uio, IO_SYNC, ctx);
+		}
+	}
+	self->traceFlushed = seq;
+	// The file stays open. Closing it from here panics (vnode_close needs a process context), and an open file
+	// blocks unmounting at shutdown: after a traced run, power the machine off by hand.
+}
+
+void IGFX::TigerLakeRegisterMap::traceArm(uint32_t by) {
+	if (traceArmed || traceDone || !traceCall)
+		return;
+	traceRec.armedBy = by;
+	traceRec.armUptime = tglUptimeSeconds();
+	traceArmed = true;
+}
+
+void IGFX::TigerLakeRegisterMap::traceNote(uint32_t address, uint32_t value, bool isWrite) {
+	if (!traceArmed) {
+		if (traceAt == 0 || traceDone || !traceCall || tglUptimeSeconds() < traceAt)
+			return;
+		traceArm(2);
+		if (!traceArmed)
+			return;
+	}
+	if (!isWrite) {
+		// Polling loops read one register thousands of times: count them in one entry, and put the entry on disk
+		// when it is new and each time the count reaches a power of four, so a loop that never ends is visible.
+		bool flush = true;
+		if (traceRec.next != 0 && traceRec.ring[(traceRec.next - 1) % TraceRecord::RingSize].address == address) {
+			uint32_t n = ++traceRec.ring[(traceRec.next - 1) % TraceRecord::RingSize].value;
+			flush = n >= 4 && (n & (n - 1)) == 0 && (__builtin_ctz(n) & 1) == 0;
+		} else {
+			auto &slot = traceRec.ring[traceRec.next % TraceRecord::RingSize];
+			slot.address = address;
+			slot.value = 1;
+			traceRec.next++;
+		}
+		if (!flush)
+			return;
+	} else {
+		auto &slot = traceRec.ring[traceRec.next % TraceRecord::RingSize];
+		slot.address = address | 0x80000000U;
+		slot.value = value;
+		traceRec.next++;
+	}
+	uint32_t seq = ++traceRec.seq;
+	thread_call_enter1(traceCall, nullptr);
+	// Give the writer up to 30 ms to put this access on disk before the driver carries on. No blocking calls here.
+	if (!has(TraceNoWait) && ml_get_interrupts_enabled()) {
+		uint32_t spins = 0;
+		while (static_cast<int32_t>(traceFlushed - seq) < 0 && spins < 300) {
+			IODelay(100);
+			spins++;
+		}
+		if (spins >= 300)
+			traceRec.waitTimeouts++;
+	}
+	if (tglUptimeSeconds() > traceRec.armUptime + 120) {
+		traceArmed = false;
+		traceDone = true;
+	}
+}
+
+void IGFX::TigerLakeRegisterMap::lateCheck(void *controller) {
+	// Called on every hooked access; cheap until the time comes.
+	// Stage 1 (wait - 15 s): publish what is already in memory (the firmware snapshot), no register reads.
+	// Stage 2 (wait + 15 s) and stage 3 (3 x wait): read the registers again, then publish.
+	if (!has(LateState) || firstTpEnableTime == 0 || lateTaken >= 3 || !publishCall)
+		return;
+	uint64_t nanos = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - firstTpEnableTime, &nanos);
+	uint32_t seconds = static_cast<uint32_t>(nanos / 1000000000ULL);
+	uint32_t due = lateTaken == 0 ? (lateWait > 15 ? lateWait - 15 : lateWait) : lateTaken == 1 ? lateWait + 15 : lateWait * 3;
+	if (seconds < due)
+		return;
+	if (lateTaken > 0) {
+		takeSnapshot(controller, state.late);
+		state.lateCount = lateTaken;
+	}
+	lateTaken++;
+	state.lateSeconds = seconds;
+	state.seq++;
+	thread_call_enter1(publishCall, controller);
+}
+
+void IGFX::TigerLakeRegisterMap::prepareTranscoderA(void *controller) {
+	auto rd = [&](uint32_t a) { return callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32(controller, a); };
+	auto wr = [&](uint32_t a, uint32_t v) { callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32(controller, a, v); };
+
+	// 7.a Direct the clock of DDI A to transcoder A
+	uint32_t clk = rd(TGLReg::TransClkSelA);
+	if (((clk >> 28) & 0xF) != 1) {
+		wr(TGLReg::TransClkSelA, 1U << 28);
+		state.synthClkSel++;
+		record(TGLReg::TransClkSelA, 1U << 28, true);
+		if (shouldLog())
+			SYSLOG("igfx", "TGLMAP: TRANS_CLK_SEL_A %08X -> %08X before DP_TP_CTL enable.", clk, 1U << 28);
+	}
+
+	// 7.b DDI select, mode and lane count in TRANS_DDI_FUNC_CTL, transcoder still disabled
+	uint32_t cur = rd(TGLReg::TransDdiFuncCtlA);
+	if (cur & TGLReg::Enable)
+		return;
+	uint32_t base = lastEdpFuncCtl ? lastEdpFuncCtl : fwFuncCtlA;
+	if ((base & TGLReg::ModeMask) != TGLReg::ModeDpSst)
+		base = TGLReg::ModeDpSst | (rd(TGLReg::DdiBufCtlA) & TGLReg::PortWidthMask);
+	uint32_t next = (base & ~TGLReg::Enable & ~(0xFU << 27)) | (1U << 27);
+	if (next != cur) {
+		wr(TGLReg::TransDdiFuncCtlA, next);
+		state.synthFuncCtl++;
+		record(TGLReg::TransDdiFuncCtlA, next, true);
+		if (shouldLog())
+			SYSLOG("igfx", "TGLMAP: TRANS_DDI_FUNC_CTL_A %08X -> %08X before DP_TP_CTL enable.", cur, next);
+	}
+}
+
+uint32_t IGFX::TigerLakeRegisterMap::read(void *controller, uint32_t address) {
+	if (!snapshotTaken)
+		snapshot(controller);
+	if (has(TraceDisk))
+		traceNote(address, 0, false);
+
+	uint32_t mapped = mapAddress(address, false);
+	uint32_t raw = callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32(controller, mapped);
+	uint32_t value = raw;
+	if (TGLReg::isFuncCtl(mapped) && has(XlateFuncCtl))
+		value = TGLReg::funcCtlToICL(raw);
+	else if (TGLReg::isClkSel(mapped) && has(XlateClkSel))
+		value = TGLReg::clkSelToICL(raw);
+	else if (TGLReg::isCfgcr0(mapped) && mapped != address && refIs38400)
+		value = TGLReg::doubleFraction(raw);
+
+	if (has(ScaleBacklight) && driverBacklightFreq != 0 && fwBacklightFreq != 0) {
+		if (address == 0xC8254)
+			value = driverBacklightFreq;
+		else if (address == 0xC8258)
+			value = static_cast<uint32_t>((static_cast<uint64_t>(raw) * driverDutyMax()) / fwBacklightFreq);
+	}
+	if (mapped != address || value != raw)
+		state.mappedReads++;
+	if (address == TGLReg::DpTpCtlA_ICL + 4) {
+		state.lastTpStatus = raw;
+		state.orTpStatus |= raw;
+	}
+
+	if ((mapped != address || value != raw) && shouldLog(true))
+		SYSLOG("igfx", "TGLMAP: R %06X -> %06X = %08X (raw %08X)", address, mapped, value, raw);
+	lateCheck(controller);
+	return value;
+}
+
+void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint32_t value) {
+	if (!snapshotTaken)
+		snapshot(controller);
+	if (has(TraceDisk)) {
+		if (address == 0xC8258 && value == 0)
+			traceArm(1);
+		traceNote(address, value, true);
+	}
+
+	auto org = callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32;
+	uint32_t mapped = mapAddress(address, true);
+	if (mapped != address && mapped + 0xF000 == address)
+		edpActivated = true;
+	uint32_t out = value;
+
+	if (address == TGLReg::TransDdiFuncCtlEdpICL && value != 0)
+		lastEdpFuncCtl = value;
+	if (TGLReg::isFuncCtl(mapped)) {
+		if (has(XlateFuncCtl))
+			out = TGLReg::funcCtlToTGL(value);
+	} else if (TGLReg::isClkSel(mapped)) {
+		if (has(XlateClkSel))
+			out = TGLReg::clkSelToTGL(value);
+		// LightUpEDP writes TRANS_CLK_SEL(pipe) = 0 right after link training: SetupParams computes 0 for a panel on
+		// DDI A because the ICL eDP transcoder has no clock select. On TGL that removes the clock of transcoder A.
+		if (has(SynthPreEnable) && mapped == TGLReg::TransClkSelA && out == 0 && ddiAActive) {
+			out = 1U << 28;
+			state.synthClkSel++;
+		}
+	} else if (mapped != address && (mapped == TGLReg::Dpll0Cfgcr0_TGL || mapped == TGLReg::Dpll0Cfgcr1_TGL ||
+									 mapped == TGLReg::Dpll1Cfgcr0_TGL || mapped == TGLReg::Dpll1Cfgcr1_TGL)) {
+		if (keepFirmwarePLL) {
+			if (shouldLog())
+				SYSLOG("igfx", "TGLMAP: W %06X = %08X dropped (firmware PLL config kept).", address, value);
+			return;
+		}
+		if (TGLReg::isCfgcr0(mapped) && refIs38400)
+			out = TGLReg::halveFraction(value);
+	}
+
+	// Backlight with brightness control: the hardware keeps the firmware's PWM frequency; duty values arrive on the
+	// driver's own scale and are rescaled. A zero duty is passed on: the driver writes it before it powers the panel
+	// down, and holding the backlight at a high duty through that power-down freezes this machine. disableDisplay also
+	// writes zero during every modeset and LightUpEDP restores only the control and frequency registers, so the last
+	// level is written back when the driver switches the PWM on again.
+	if (has(ScaleBacklight) && (address == 0xC8250 || address == 0xC8254 || address == 0xC8258)) {
+		uint32_t out = value;
+		bool restore = false;
+		if (address == 0xC8250) {
+			restore = backlightBlanked && (value & 0x80000000U) != 0;
+		} else if (address == 0xC8254) {
+			if (value != 0)
+				driverBacklightFreq = value;
+			out = fwBacklightFreq ? fwBacklightFreq : value;
+			restore = backlightBlanked && value != 0;
+		} else if (value == 0) {
+			backlightBlanked = true;
+		} else {
+			if (driverBacklightFreq != 0 && fwBacklightFreq != 0) {
+				out = static_cast<uint32_t>((static_cast<uint64_t>(value) * fwBacklightFreq) / driverDutyMax());
+				if (out > fwBacklightFreq)
+					out = fwBacklightFreq;
+				if (out == 0)
+					out = 1;
+			}
+			lastBacklightDuty = out;
+			backlightBlanked = false;
+		}
+		record(address, out, true);
+		state.mappedWrites++;
+		if (out != 0 || address != 0xC8254)
+			org(controller, address, out);
+		if (restore) {
+			uint32_t max = fwBacklightFreq ? fwBacklightFreq : driverBacklightFreq;
+			uint32_t duty = lastBacklightDuty ? lastBacklightDuty : (fwBacklightDuty ? fwBacklightDuty : max / 2);
+			lastBacklightDuty = duty;
+			backlightBlanked = false;
+			record(0xC8258, duty, true);
+			org(controller, 0xC8258, duty);
+		}
+		lateCheck(controller);
+		return;
+	}
+
+	// Backlight: keep what the firmware programmed. Nothing on this machine raises the duty again after the driver zeroes it.
+	if (has(KeepBacklight) && (address == 0xC8254 || address == 0xC8258)) {
+		uint32_t keep = address == 0xC8254 ? fwBacklightFreq : fwBacklightDuty;
+		if (keep == 0 && address == 0xC8258)
+			keep = fwBacklightFreq / 2;
+		record(address, keep, true);
+		state.mappedWrites++;
+		if (keep != 0)
+			org(controller, address, keep);
+		lateCheck(controller);
+		return;
+	}
+
+	if (address == TGLReg::DpTpCtlA_ICL)
+		ddiAActive = (value & TGLReg::Enable) != 0;
+	if (ddiAActive && firstTpEnableTime == 0)
+		firstTpEnableTime = mach_absolute_time();
+	bool tpEnable = has(SynthPreEnable) && address == TGLReg::DpTpCtlA_ICL && (value & TGLReg::Enable);
+	if (tpEnable)
+		prepareTranscoderA(controller);
+
+	bool translated = mapped != address || out != value;
+	if (translated)
+		state.mappedWrites++;
+	bool interesting = translated || (mapped >= 0x64000 && mapped <= 0x640FF) || mapped == 0x46010 || mapped == 0x46014 || mapped == 0x164280 ||
+		(mapped >= 0x60000 && mapped <= 0x60FFF) || mapped == TGLReg::TransConfA || TGLReg::isClkSel(mapped) || mapped == 0xC7204;
+	if (interesting)
+		record(mapped, out, translated);
+	if (TGLReg::isFuncCtl(mapped)) {
+		state.lastFuncCtlAddr = address; state.lastFuncCtlDriver = value; state.lastFuncCtlOut = out;
+	} else if (mapped == TGLReg::TransConfA) {
+		state.lastConfAddr = address; state.lastConf = out;
+	} else if (TGLReg::isCfgcr0(mapped)) {
+		state.lastCfgcr0Addr = address; state.lastCfgcr0Driver = value; state.lastCfgcr0Out = out;
+	} else if (mapped == TGLReg::Dpll0Cfgcr1_TGL || mapped == TGLReg::Dpll1Cfgcr1_TGL) {
+		state.lastCfgcr1Addr = address; state.lastCfgcr1Out = out;
+	} else if (mapped == TGLReg::DdiBufCtlA) {
+		state.lastDdiBufCtl = out;
+	} else if (mapped == 0x46010) {
+		state.lastDpll0Enable = out;
+	} else if (mapped == 0x46014) {
+		state.lastDpll1Enable = out;
+	} else if (mapped == 0x164280) {
+		state.lastDpclka = out;
+	} else if (TGLReg::isClkSel(mapped)) {
+		state.lastClkSelOut = out;
+	} else if (address == TGLReg::DpTpCtlA_ICL) {
+		state.lastTpCtl = out;
+		if (out & TGLReg::Enable) state.tpEnables++; else state.tpDisables++;
+	}
+
+	if ((translated || trace) && shouldLog())
+		SYSLOG("igfx", "TGLMAP: W %06X -> %06X = %08X (driver %08X)", address, mapped, out, value);
+	org(controller, mapped, out);
+
+	// Publish the state when link training ends either way: pattern bits 10:8 = 3 is "normal" (trained), disable is a failure or teardown
+	if (address == TGLReg::DpTpCtlA_ICL && (!(out & TGLReg::Enable) || ((out >> 8) & 7) == 3))
+		publish(controller, true);
+
+	// Port disabled. Earlier revisions cleared the DDI select in TRANS_DDI_FUNC_CTL_A and then TRANS_CLK_SEL_A here.
+	// Six on-disk traces of the display-sleep freeze (with and without the DMC firmware, with the driver held back
+	// and at full speed) all end right after that FUNC_CTL write, at the read of TRANS_CLK_SEL_A that followed it.
+	// Nothing is touched now: the transcoder is off, and prepareTranscoderA programs both registers again before the
+	// next enable.
+	if (has(SynthPreEnable) && has(TraceDisk) && address == TGLReg::DpTpCtlA_ICL && !(value & TGLReg::Enable))
+		traceNote(0x40000000U | 0x7, 0, true);       // marker: port disabled, no clean-up
+	if (has(TraceDisk) && address == TGLReg::DpTpCtlA_ICL && !(value & TGLReg::Enable))
+		traceNote(0x40000000U | 0x4, 0, true);     // marker: returning to the driver after DP_TP_CTL disable
+	lateCheck(controller);
 }
 
 // MARK: - Force Complete Modeset
