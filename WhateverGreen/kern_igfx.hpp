@@ -2600,7 +2600,7 @@ private:
 			KeepBacklight    = 0x4000, // drop the driver's writes to BXT_BLC_PWM_FREQ1/DUTY1 (0xC8254/0xC8258) and restore the
 			                           // firmware's values if they were zero: run F5 showed the driver leaves the duty at 0
 			ScaleBacklight   = 0x8000, // brightness control: keep the firmware's PWM frequency, rescale the duty the driver writes
-			                           // (driver scale -> firmware scale) and never write a zero duty
+			                           // (driver scale -> firmware scale); pass blanking zeros through and restore on re-enable
 			LateState        = 0x2000, // snapshot the hardware at the first access and again igfxtglwait seconds (default 60) after the
 			                           // first DP_TP_CTL enable, and only then publish the record to NVRAM and the registry
 			EdpCoreOnly      = 0x800,  // with MapEdpTranscoder: map only timings/M-N (0x6F000-0x6F0FF), FUNC_CTL/MSA (0x6F400-0x6F41F)
@@ -2748,19 +2748,25 @@ private:
 		void lateCheck(void *controller);
 
 		/**
-		 *  Opt-in diagnostic (-igfxtgldiag). A bounded number of significant display transitions
-		 *  is reported by a separate kernel thread, never from the MMIO hook itself.
+		 *  Opt-in diagnostic (-igfxtgldiag). Immutable, preallocated events are reported by a separate kernel thread.
+		 *  Reservation makes one atomic attempt: contention or a full buffer drops the event without waiting.
 		 *  No additional MMIO, filesystem, IORegistry, or NVRAM accesses are performed.
 		 */
 		bool diagnosticEnabled {false};
-		volatile uint32_t diagnosticBudget {24};
-		volatile uint32_t diagnosticSequence {0};
-		volatile uint32_t diagnosticStage {0};
-		volatile uint32_t diagnosticAddress {0};
-		volatile uint32_t diagnosticValue {0};
+		static constexpr uint32_t DiagnosticCapacity = 64;
+		struct DiagnosticEvent {
+			volatile uint32_t ready {0}; // 0 filling, 1 published, 2 consumed; slots are never reused
+			uint64_t time {0};          // mach_absolute_time, not wall-clock time
+			uint32_t stage {0};
+			uint32_t address {0};       // physical address passed to the original register accessor
+			uint32_t requested {0};     // driver value; same as value for observed reads or synthesized writes
+			uint32_t value {0};         // value passed to / returned by the original accessor, not a write readback
+		} diagnosticEvents[DiagnosticCapacity] {};
+		volatile uint32_t diagnosticNext {0};
+		bool diagnosticTpStatusSeen {false};
 		thread_call_t diagnosticCall {nullptr};
 		static void diagnosticThread(thread_call_param_t self, thread_call_param_t);
-		void noteDiagnostic(uint32_t stage, uint32_t address, uint32_t value);
+		void noteDiagnostic(uint32_t stage, uint32_t address, uint32_t value, uint32_t requested);
 
 		/**
 		 *  Publishing runs on a kernel thread call: doing it inside the register hooks reset the machine (runs B and F3)

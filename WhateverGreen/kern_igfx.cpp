@@ -963,8 +963,11 @@ void IGFX::TigerLakeRegisterMap::processKernel(KernelPatcher &patcher, DeviceInf
 	features = mask;
 	// Diagnostics are explicitly opt-in and are not executed in the display register hooks.
 	diagnosticEnabled = checkKernelArgument("-igfxtgldiag");
-	if (diagnosticEnabled)
+	if (diagnosticEnabled) {
 		diagnosticCall = thread_call_allocate(diagnosticThread, this);
+		SYSLOG("igfx", "TGLDIAG: deferred capture %s (capacity %u, raw accesses only).",
+			diagnosticCall ? "enabled" : "unavailable", DiagnosticCapacity);
+	}
 	trace = has(Log) && checkKernelArgument("-igfxtgltrace");
 	PE_parse_boot_argn("igfxtglwait", &lateWait, sizeof(lateWait));
 	if (has(LateState))
@@ -1065,7 +1068,8 @@ void IGFX::TigerLakeRegisterMap::snapshot(void *controller) {
 	refIs38400 = ((rd(controller, TGLReg::Dssm) >> 29) & 7) == 2;
 	fwBacklightFreq = rd(controller, 0xC8254);
 	fwBacklightDuty = rd(controller, 0xC8258);
-	noteDiagnostic(1, 0xC8258, fwBacklightDuty); // first MMIO access / firmware backlight duty
+	noteDiagnostic(1, 0xC8258, fwBacklightDuty, fwBacklightDuty); // firmware duty, already read above
+	noteDiagnostic(17, 0xC8254, fwBacklightFreq, fwBacklightFreq); // firmware PWM period, already read above
 	// The driver never writes BXT_BLC_PWM_FREQ1 when it adopts the firmware's mode without a full modeset, so its scale
 	// cannot be learned from a write. AppleIntelFramebufferController::start picks it from SFUSE_STRAP bit 8:
 	// 0x56CE when set, 0x4571 when clear, and hwSetBacklight computes duty = level * that / 65535.
@@ -1113,23 +1117,30 @@ void IGFX::TigerLakeRegisterMap::publishThread(thread_call_param_t param0, threa
 
 void IGFX::TigerLakeRegisterMap::diagnosticThread(thread_call_param_t param0, thread_call_param_t) {
 	// Asynchronous kernel-thread context: no hardware reads/writes or persistent storage.
-	// A pending invocation may be coalesced with a newer stage; this is best-effort telemetry.
 	auto self = static_cast<TigerLakeRegisterMap *>(param0);
-	SYSLOG("igfx", "TGLDIAG: seq=%u stage=%u addr=%06X value=%08X tpOn=%u tpOff=%u tpStatus=%08X mappedR=%u mappedW=%u",
-		self->diagnosticSequence, self->diagnosticStage, self->diagnosticAddress, self->diagnosticValue,
-		self->state.tpEnables, self->state.tpDisables, self->state.lastTpStatus,
-		self->state.mappedReads, self->state.mappedWrites);
+	for (uint32_t i = 0; i < DiagnosticCapacity; i++) {
+		auto &event = self->diagnosticEvents[i];
+		// The atomic operation is also the publication barrier. Each immutable slot is printed at most once,
+		// even if calls coalesce or another worker runs before this one finishes logging.
+		if (OSCompareAndSwap(1, 2, &event.ready))
+			SYSLOG("igfx", "TGLDIAG: seq=%u time=%llu stage=%u addr=%06X requested=%08X value=%08X",
+				i + 1, static_cast<unsigned long long>(event.time), event.stage, event.address, event.requested, event.value);
+	}
 }
 
-void IGFX::TigerLakeRegisterMap::noteDiagnostic(uint32_t stage, uint32_t address, uint32_t value) {
-	if (!diagnosticEnabled || diagnosticCall == nullptr || diagnosticBudget == 0)
+void IGFX::TigerLakeRegisterMap::noteDiagnostic(uint32_t stage, uint32_t address, uint32_t value, uint32_t requested) {
+	if (!diagnosticEnabled || diagnosticCall == nullptr)
 		return;
-	// The hook only updates preallocated counters and queues a deferred call.
-	--diagnosticBudget;
-	++diagnosticSequence;
-	diagnosticStage = stage;
-	diagnosticAddress = address;
-	diagnosticValue = value;
+	uint32_t index = diagnosticNext;
+	if (index >= DiagnosticCapacity || !OSCompareAndSwap(index, index + 1, &diagnosticNext))
+		return;
+	auto &event = diagnosticEvents[index];
+	event.time = mach_absolute_time();
+	event.stage = stage;
+	event.address = address;
+	event.requested = requested;
+	event.value = value;
+	OSCompareAndSwap(0, 1, &event.ready);
 	thread_call_enter(diagnosticCall);
 }
 
@@ -1253,6 +1264,7 @@ void IGFX::TigerLakeRegisterMap::prepareTranscoderA(void *controller) {
 	uint32_t clk = rd(TGLReg::TransClkSelA);
 	if (((clk >> 28) & 0xF) != 1) {
 		wr(TGLReg::TransClkSelA, 1U << 28);
+		noteDiagnostic(18, TGLReg::TransClkSelA, 1U << 28, 1U << 28);
 		state.synthClkSel++;
 		record(TGLReg::TransClkSelA, 1U << 28, true);
 		if (shouldLog())
@@ -1269,6 +1281,7 @@ void IGFX::TigerLakeRegisterMap::prepareTranscoderA(void *controller) {
 	uint32_t next = (base & ~TGLReg::Enable & ~(0xFU << 27)) | (1U << 27);
 	if (next != cur) {
 		wr(TGLReg::TransDdiFuncCtlA, next);
+		noteDiagnostic(19, TGLReg::TransDdiFuncCtlA, next, next);
 		state.synthFuncCtl++;
 		record(TGLReg::TransDdiFuncCtlA, next, true);
 		if (shouldLog())
@@ -1300,7 +1313,11 @@ uint32_t IGFX::TigerLakeRegisterMap::read(void *controller, uint32_t address) {
 	}
 	if (mapped != address || value != raw)
 		state.mappedReads++;
-	if (address == TGLReg::DpTpCtlA_ICL + 4) {
+	if (mapped == TGLReg::DpTpCtlA_TGL + 4 || address == TGLReg::DpTpCtlA_ICL + 4) {
+		// Observe only reads the driver already made. DP_TP_STATUS is not the sink's AUX/DPCD link status.
+		if (!diagnosticTpStatusSeen || state.lastTpStatus != raw)
+			noteDiagnostic(12, mapped, raw, raw);
+		diagnosticTpStatusSeen = true;
 		state.lastTpStatus = raw;
 		state.orTpStatus |= raw;
 	}
@@ -1383,6 +1400,10 @@ void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint3
 		state.mappedWrites++;
 		if (out != 0 || address != 0xC8254)
 			org(controller, address, out);
+		if (address == 0xC8258)
+			noteDiagnostic(out == 0 ? 7 : 8, address, out, value); // PWM duty write, not proof of backlight output
+		else if (address != 0xC8254 || out != 0)
+			noteDiagnostic(address == 0xC8250 ? 9 : 10, address, out, value);
 		if (restore) {
 			uint32_t max = fwBacklightFreq ? fwBacklightFreq : driverBacklightFreq;
 			uint32_t duty = lastBacklightDuty ? lastBacklightDuty : (fwBacklightDuty ? fwBacklightDuty : max / 2);
@@ -1390,9 +1411,8 @@ void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint3
 			backlightBlanked = false;
 			record(0xC8258, duty, true);
 			org(controller, 0xC8258, duty);
+			noteDiagnostic(11, 0xC8258, duty, duty); // implicit PWM restore, not a driver duty write
 		}
-		if (address == 0xC8258)
-			noteDiagnostic(out == 0 ? 7 : 8, address, out); // PWM duty off / on
 		lateCheck(controller);
 		return;
 	}
@@ -1406,8 +1426,8 @@ void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint3
 		state.mappedWrites++;
 		if (keep != 0)
 			org(controller, address, keep);
-		if (address == 0xC8258)
-			noteDiagnostic(8, address, keep); // firmware PWM duty retained
+		if (keep != 0)
+			noteDiagnostic(address == 0xC8258 ? 8 : 10, address, keep, value);
 		lateCheck(controller);
 		return;
 	}
@@ -1453,14 +1473,24 @@ void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint3
 	if ((translated || trace) && shouldLog())
 		SYSLOG("igfx", "TGLMAP: W %06X -> %06X = %08X (driver %08X)", address, mapped, out, value);
 	org(controller, mapped, out);
-	if (address == TGLReg::DpTpCtlA_ICL)
-		noteDiagnostic(!(out & TGLReg::Enable) ? 3 : ((out >> 8) & 7) == 3 ? 4 : 2, mapped, out);
+	if (address == TGLReg::DpTpCtlA_ICL || mapped == TGLReg::DpTpCtlA_TGL)
+		noteDiagnostic(!(out & TGLReg::Enable) ? 3 : ((out >> 8) & 7) == 3 ? 4 : 2, mapped, out, value);
 	else if (mapped == TGLReg::TransConfA)
-		noteDiagnostic(out & TGLReg::Enable ? 5 : 6, mapped, out);
+		noteDiagnostic(out & TGLReg::Enable ? 5 : 6, mapped, out, value);
 	else if (address == 0xC8258)
-		noteDiagnostic(out == 0 ? 7 : 8, address, out);
+		noteDiagnostic(out == 0 ? 7 : 8, address, out, value);
+	else if (address == 0xC8250 || address == 0xC8254)
+		noteDiagnostic(address == 0xC8250 ? 9 : 10, mapped, out, value);
+	else if (mapped == TGLReg::TransClkSelA)
+		noteDiagnostic(13, mapped, out, value);
+	else if (mapped == TGLReg::TransDdiFuncCtlA)
+		noteDiagnostic(14, mapped, out, value);
+	else if (mapped == TGLReg::DdiBufCtlA)
+		noteDiagnostic(15, mapped, out, value);
+	else if (mapped == 0xC7204)
+		noteDiagnostic(16, mapped, out, value);
 
-	// Publish the state when link training ends either way: pattern bits 10:8 = 3 is "normal" (trained), disable is a failure or teardown
+	// Pattern bits 10:8 = 3 select normal transmission, not proof of sink CR/EQ success; disable may be teardown.
 	if (address == TGLReg::DpTpCtlA_ICL && (!(out & TGLReg::Enable) || ((out >> 8) & 7) == 3))
 		publish(controller, true);
 
