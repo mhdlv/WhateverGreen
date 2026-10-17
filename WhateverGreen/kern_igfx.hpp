@@ -2582,6 +2582,35 @@ private:
 	 */
 	class TigerLakeRegisterMap: public PatchSubmodule {
 	public:
+#ifdef DEBUG
+		/**
+		 *  Opt-in, bounded diagnostics selected by `-igfxtgldiag` on a real Tiger Lake CPU.
+		 *  MMIO paths only fill a fixed event slot and schedule a thread call. Logging happens on that thread.
+		 */
+		enum DiagnosticEvent : uint32_t {
+			DiagInit, DiagReadHook, DiagWriteHook, DiagFirstRead, DiagFirstWrite, DiagEdpMap, DiagDpTpMap,
+			DiagPreBegin, DiagPreClock, DiagPreFunc, DiagTpEnable, DiagPwmBase, DiagEventCount = DiagPwmBase + 6
+		};
+		struct DiagnosticRecord {
+			volatile UInt32 state {0}; // 0 empty, 1 being filled, 2 ready, 3 publishing, 4 log call completed
+			uint32_t value[4] {};
+		};
+		bool diagnostics {false};
+		DiagnosticRecord diagEvents[DiagEventCount] {};
+		thread_call_t diagCall {nullptr};
+
+		static void diagnoseThread(thread_call_param_t self, thread_call_param_t);
+		bool captureDiagnostic(DiagnosticEvent event, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0, uint32_t d = 0);
+		void diagnoseHook(bool write, bool installed);
+		void diagnoseFirstAccess(bool write, uint32_t address, uint32_t value);
+		void diagnoseMapping(uint32_t address, uint32_t mapped);
+		bool diagnosePreEnable();
+		void diagnosePreClock(uint32_t current, uint32_t requested, bool write);
+		void diagnosePreFunc(uint32_t current, uint32_t requested, bool write, bool enabled);
+		void diagnoseTpEnable(uint32_t driver, uint32_t output);
+		void diagnoseBacklight(uint32_t address, uint32_t driver, uint32_t output, bool restore);
+#endif
+
 		/**
 		 *  Feature mask, `igfxtglmap=<mask>`. `-igfxtglmap` means every translation and no side effects (0x3F).
 		 *  Side effects (registry, NVRAM, logging) are opt-in: the first 0003 build did them unconditionally at the

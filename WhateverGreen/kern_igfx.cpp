@@ -477,11 +477,20 @@ void IGFX::MMIORegistersReadSupport::processFramebufferKext(KernelPatcher &patch
 		DBGLOG("igfx", "RRS: Will setup the read register module for SKL/KBL/CFL/ICL platform.");
 	} else {
 		SYSLOG("igfx", "RRS: Found an unsupported platform. Will disable all submodules that depend on RRS.");
+#ifdef DEBUG
+		callbackIGFX->modTigerLakeRegisterMap.diagnoseHook(false, false);
+#endif
 		return disableDependentSubmodules();
 	}
 	
 	KernelPatcher::RouteRequest request(symbol, wrapReadRegister32, orgReadRegister32);
+#ifdef DEBUG
+	bool installed = patcher.routeMultiple(index, &request, 1, address, size);
+	callbackIGFX->modTigerLakeRegisterMap.diagnoseHook(false, installed);
+	if (!installed) {
+#else
 	if (!patcher.routeMultiple(index, &request, 1, address, size)) {
+#endif
 		SYSLOG("igfx", "RRS: Failed to resolve the symbol of ReadRegister32. Will disable all submodules that rely on this one.");
 		disableDependentSubmodules();
 	}
@@ -494,6 +503,9 @@ void IGFX::MMIORegistersReadSupport::disableDependentSubmodules() {
 }
 
 uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, uint32_t address) {
+#ifdef DEBUG
+	callbackIGFX->modTigerLakeRegisterMap.diagnoseFirstAccess(false, address, 0);
+#endif
 	// Guard: Perform prologue injections
 	auto prologueInjector = callbackIGFX->modMMIORegistersReadSupport.prologueList.getInjector(address);
 	if (prologueInjector) {
@@ -572,11 +584,20 @@ void IGFX::MMIORegistersWriteSupport::processFramebufferKext(KernelPatcher &patc
 		DBGLOG("igfx", "RWS: Will setup the read register module for SKL/KBL/CFL/ICL platform.");
 	} else {
 		SYSLOG("igfx", "RWS: Found an unsupported platform. Will disable all submodules that depend on RWS.");
+#ifdef DEBUG
+		callbackIGFX->modTigerLakeRegisterMap.diagnoseHook(true, false);
+#endif
 		return disableDependentSubmodules();
 	}
 	
 	KernelPatcher::RouteRequest request(symbol, wrapWriteRegister32, orgWriteRegister32);
+#ifdef DEBUG
+	bool installed = patcher.routeMultiple(index, &request, 1, address, size);
+	callbackIGFX->modTigerLakeRegisterMap.diagnoseHook(true, installed);
+	if (!installed) {
+#else
 	if (!patcher.routeMultiple(index, &request, 1, address, size)) {
+#endif
 		SYSLOG("igfx", "RWS: Failed to resolve the symbol of WriteRegister32. Will disable all submodules that rely on this one.");
 		disableDependentSubmodules();
 	}
@@ -589,6 +610,9 @@ void IGFX::MMIORegistersWriteSupport::disableDependentSubmodules() {
 }
 
 void IGFX::MMIORegistersWriteSupport::wrapWriteRegister32(void *controller, uint32_t address, uint32_t value) {
+#ifdef DEBUG
+	callbackIGFX->modTigerLakeRegisterMap.diagnoseFirstAccess(true, address, value);
+#endif
 	// Guard: Perform prologue injections
 	auto prologueInjector = callbackIGFX->modMMIORegistersWriteSupport.prologueList.getInjector(address);
 	if (prologueInjector) {
@@ -971,7 +995,107 @@ void IGFX::TigerLakeRegisterMap::processKernel(KernelPatcher &patcher, DeviceInf
 	}
 	keepFirmwarePLL = checkKernelArgument("-igfxtglfwpll");
 	SYSLOG("igfx", "TGLMAP: Translating Ice Lake display registers for Tiger Lake (features 0x%X, fwpll %d).", features, keepFirmwarePLL);
+#ifdef DEBUG
+	diagnostics = checkKernelArgument("-igfxtgldiag");
+	if (diagnostics) {
+		diagCall = thread_call_allocate(diagnoseThread, this);
+		if (diagCall)
+			captureDiagnostic(DiagInit, model, static_cast<uint32_t>(BaseDeviceInfo::get().cpuGeneration), features, has(LateState));
+		else
+			diagnostics = false;
+	}
+#endif
 }
+
+#ifdef DEBUG
+bool IGFX::TigerLakeRegisterMap::captureDiagnostic(DiagnosticEvent event, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+	if (!diagnostics || !diagCall || event >= DiagEventCount)
+		return false;
+	auto &record = diagEvents[event];
+	if (!OSCompareAndSwap(0, 1, &record.state))
+		return false;
+	record.value[0] = a;
+	record.value[1] = b;
+	record.value[2] = c;
+	record.value[3] = d;
+	OSCompareAndSwap(1, 2, &record.state);
+	thread_call_enter(diagCall);
+	return true;
+}
+
+void IGFX::TigerLakeRegisterMap::diagnoseThread(thread_call_param_t param0, thread_call_param_t) {
+	auto self = static_cast<TigerLakeRegisterMap *>(param0);
+	for (uint32_t i = 0; i < DiagEventCount; i++) {
+		auto &record = self->diagEvents[i];
+		if (!OSCompareAndSwap(2, 3, &record.state))
+			continue;
+		auto v = record.value;
+		switch (i) {
+			case DiagInit: DBGLOG("igfx", "TGLDIAG: init real-model=0x%X lilu-generation=%u features=0x%X snapshots=%u.", v[0], v[1], v[2], v[3]); break;
+			case DiagReadHook: DBGLOG("igfx", "TGLDIAG: ReadRegister32 hook %s.", v[0] ? "installed" : "failed"); break;
+			case DiagWriteHook: DBGLOG("igfx", "TGLDIAG: WriteRegister32 hook %s.", v[0] ? "installed" : "failed"); break;
+			case DiagFirstRead: DBGLOG("igfx", "TGLDIAG: first read hook access address=%06X.", v[0]); break;
+			case DiagFirstWrite: DBGLOG("igfx", "TGLDIAG: first write hook access address=%06X value=%08X.", v[0], v[1]); break;
+			case DiagEdpMap: DBGLOG("igfx", "TGLDIAG: first eDP mapping %06X -> %06X.", v[0], v[1]); break;
+			case DiagDpTpMap: DBGLOG("igfx", "TGLDIAG: first DP_TP mapping %06X -> %06X.", v[0], v[1]); break;
+			case DiagPreBegin: DBGLOG("igfx", "TGLDIAG: transcoder-A pre-enable begin."); break;
+			case DiagPreClock: DBGLOG("igfx", "TGLDIAG: pre-enable step clock current=%08X requested=%08X write=%u.", v[0], v[1], v[2]); break;
+			case DiagPreFunc:
+				if (v[3]) DBGLOG("igfx", "TGLDIAG: pre-enable step func current=%08X already-enabled=1; DP_TP follows without FUNC_CTL write.", v[0]);
+				else DBGLOG("igfx", "TGLDIAG: pre-enable step func current=%08X requested=%08X write=%u; DP_TP follows.", v[0], v[1], v[2]);
+				break;
+			case DiagTpEnable: DBGLOG("igfx", "TGLDIAG: pre-enable step DP_TP_CTL driver=%08X output=%08X; hardware write follows.", v[0], v[1]); break;
+			default:
+				if (i >= DiagPwmBase) DBGLOG("igfx", "TGLDIAG: PWM %06X first-%s driver=%08X output=%08X restore=%u.", v[0], v[1] ? "nonzero" : "zero", v[1], v[2], v[3]);
+				break;
+		}
+		OSCompareAndSwap(3, 4, &record.state);
+	}
+}
+
+void IGFX::TigerLakeRegisterMap::diagnoseHook(bool write, bool installed) {
+	captureDiagnostic(write ? DiagWriteHook : DiagReadHook, installed);
+}
+
+void IGFX::TigerLakeRegisterMap::diagnoseFirstAccess(bool write, uint32_t address, uint32_t value) {
+	captureDiagnostic(write ? DiagFirstWrite : DiagFirstRead, address, value);
+}
+
+void IGFX::TigerLakeRegisterMap::diagnoseMapping(uint32_t address, uint32_t mapped) {
+	if (address == mapped)
+		return;
+	bool edp = (address >= 0x6F000 && address <= 0x6FFFF) || (address >= 0x7F000 && address <= 0x7FFFF);
+	bool dpTp = address == 0x64040 || address == 0x64044;
+	if (edp)
+		captureDiagnostic(DiagEdpMap, address, mapped);
+	if (dpTp)
+		captureDiagnostic(DiagDpTpMap, address, mapped);
+}
+
+bool IGFX::TigerLakeRegisterMap::diagnosePreEnable() {
+	return captureDiagnostic(DiagPreBegin);
+}
+
+void IGFX::TigerLakeRegisterMap::diagnosePreClock(uint32_t current, uint32_t requested, bool write) {
+	captureDiagnostic(DiagPreClock, current, requested, write);
+}
+
+void IGFX::TigerLakeRegisterMap::diagnosePreFunc(uint32_t current, uint32_t requested, bool write, bool enabled) {
+	captureDiagnostic(DiagPreFunc, current, requested, write, enabled);
+}
+
+void IGFX::TigerLakeRegisterMap::diagnoseTpEnable(uint32_t driver, uint32_t output) {
+	captureDiagnostic(DiagTpEnable, driver, output);
+}
+
+void IGFX::TigerLakeRegisterMap::diagnoseBacklight(uint32_t address, uint32_t driver, uint32_t output, bool restore) {
+	if (address != 0xC8250 && address != 0xC8254 && address != 0xC8258)
+		return;
+	uint32_t reg = address == 0xC8250 ? 0 : address == 0xC8254 ? 1 : 2;
+	uint32_t slot = reg + (driver != 0 ? 3 : 0);
+	captureDiagnostic(static_cast<DiagnosticEvent>(DiagPwmBase + slot), address, driver, output, restore);
+}
+#endif
 
 bool IGFX::TigerLakeRegisterMap::shouldLog(bool isRead) {
 	// IOLog may block: only when asked for, and never with interrupts disabled
@@ -1221,9 +1345,16 @@ void IGFX::TigerLakeRegisterMap::lateCheck(void *controller) {
 void IGFX::TigerLakeRegisterMap::prepareTranscoderA(void *controller) {
 	auto rd = [&](uint32_t a) { return callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32(controller, a); };
 	auto wr = [&](uint32_t a, uint32_t v) { callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32(controller, a, v); };
+#ifdef DEBUG
+	bool diagnose = diagnosePreEnable();
+#endif
 
 	// 7.a Direct the clock of DDI A to transcoder A
 	uint32_t clk = rd(TGLReg::TransClkSelA);
+#ifdef DEBUG
+	if (diagnose)
+		diagnosePreClock(clk, 1U << 28, ((clk >> 28) & 0xF) != 1);
+#endif
 	if (((clk >> 28) & 0xF) != 1) {
 		wr(TGLReg::TransClkSelA, 1U << 28);
 		state.synthClkSel++;
@@ -1234,12 +1365,21 @@ void IGFX::TigerLakeRegisterMap::prepareTranscoderA(void *controller) {
 
 	// 7.b DDI select, mode and lane count in TRANS_DDI_FUNC_CTL, transcoder still disabled
 	uint32_t cur = rd(TGLReg::TransDdiFuncCtlA);
-	if (cur & TGLReg::Enable)
+	if (cur & TGLReg::Enable) {
+#ifdef DEBUG
+		if (diagnose)
+			diagnosePreFunc(cur, 0, false, true);
+#endif
 		return;
+	}
 	uint32_t base = lastEdpFuncCtl ? lastEdpFuncCtl : fwFuncCtlA;
 	if ((base & TGLReg::ModeMask) != TGLReg::ModeDpSst)
 		base = TGLReg::ModeDpSst | (rd(TGLReg::DdiBufCtlA) & TGLReg::PortWidthMask);
 	uint32_t next = (base & ~TGLReg::Enable & ~(0xFU << 27)) | (1U << 27);
+#ifdef DEBUG
+	if (diagnose)
+		diagnosePreFunc(cur, next, next != cur, false);
+#endif
 	if (next != cur) {
 		wr(TGLReg::TransDdiFuncCtlA, next);
 		state.synthFuncCtl++;
@@ -1256,6 +1396,9 @@ uint32_t IGFX::TigerLakeRegisterMap::read(void *controller, uint32_t address) {
 		traceNote(address, 0, false);
 
 	uint32_t mapped = mapAddress(address, false);
+#ifdef DEBUG
+	diagnoseMapping(address, mapped);
+#endif
 	uint32_t raw = callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32(controller, mapped);
 	uint32_t value = raw;
 	if (TGLReg::isFuncCtl(mapped) && has(XlateFuncCtl))
@@ -1295,6 +1438,9 @@ void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint3
 
 	auto org = callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32;
 	uint32_t mapped = mapAddress(address, true);
+#ifdef DEBUG
+	diagnoseMapping(address, mapped);
+#endif
 	if (mapped != address && mapped + 0xF000 == address)
 		edpActivated = true;
 	uint32_t out = value;
@@ -1352,6 +1498,9 @@ void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint3
 			lastBacklightDuty = out;
 			backlightBlanked = false;
 		}
+#ifdef DEBUG
+		diagnoseBacklight(address, value, out, restore);
+#endif
 		record(address, out, true);
 		state.mappedWrites++;
 		if (out != 0 || address != 0xC8254)
@@ -1373,6 +1522,9 @@ void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint3
 		uint32_t keep = address == 0xC8254 ? fwBacklightFreq : fwBacklightDuty;
 		if (keep == 0 && address == 0xC8258)
 			keep = fwBacklightFreq / 2;
+#ifdef DEBUG
+		diagnoseBacklight(address, value, keep, false);
+#endif
 		record(address, keep, true);
 		state.mappedWrites++;
 		if (keep != 0)
@@ -1386,8 +1538,12 @@ void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint3
 	if (ddiAActive && firstTpEnableTime == 0)
 		firstTpEnableTime = mach_absolute_time();
 	bool tpEnable = has(SynthPreEnable) && address == TGLReg::DpTpCtlA_ICL && (value & TGLReg::Enable);
-	if (tpEnable)
+	if (tpEnable) {
 		prepareTranscoderA(controller);
+#ifdef DEBUG
+		diagnoseTpEnable(value, out);
+#endif
+	}
 
 	bool translated = mapped != address || out != value;
 	if (translated)
