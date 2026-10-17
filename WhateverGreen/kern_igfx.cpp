@@ -961,6 +961,10 @@ void IGFX::TigerLakeRegisterMap::processKernel(KernelPatcher &patcher, DeviceInf
 
 	enabled = true;
 	features = mask;
+	// Diagnostics are explicitly opt-in and are not executed in the display register hooks.
+	diagnosticEnabled = checkKernelArgument("-igfxtgldiag");
+	if (diagnosticEnabled)
+		diagnosticCall = thread_call_allocate(diagnosticThread, this);
 	trace = has(Log) && checkKernelArgument("-igfxtgltrace");
 	PE_parse_boot_argn("igfxtglwait", &lateWait, sizeof(lateWait));
 	if (has(LateState))
@@ -1061,6 +1065,7 @@ void IGFX::TigerLakeRegisterMap::snapshot(void *controller) {
 	refIs38400 = ((rd(controller, TGLReg::Dssm) >> 29) & 7) == 2;
 	fwBacklightFreq = rd(controller, 0xC8254);
 	fwBacklightDuty = rd(controller, 0xC8258);
+	noteDiagnostic(1, 0xC8258, fwBacklightDuty); // first MMIO access / firmware backlight duty
 	// The driver never writes BXT_BLC_PWM_FREQ1 when it adopts the firmware's mode without a full modeset, so its scale
 	// cannot be learned from a write. AppleIntelFramebufferController::start picks it from SFUSE_STRAP bit 8:
 	// 0x56CE when set, 0x4571 when clear, and hwSetBacklight computes duty = level * that / 65535.
@@ -1104,6 +1109,28 @@ void IGFX::TigerLakeRegisterMap::publishThread(thread_call_param_t param0, threa
 	// present in every run that reset when publishing (B, F3, F4), so neither is used here.
 	auto self = static_cast<TigerLakeRegisterMap *>(param0);
 	FileIO::writeBufferToFile("/Users/Shared/tgl-map-state.bin", &self->state, sizeof(self->state));
+}
+
+void IGFX::TigerLakeRegisterMap::diagnosticThread(thread_call_param_t param0, thread_call_param_t) {
+	// Asynchronous kernel-thread context: no hardware reads/writes or persistent storage.
+	// A pending invocation may be coalesced with a newer stage; this is best-effort telemetry.
+	auto self = static_cast<TigerLakeRegisterMap *>(param0);
+	SYSLOG("igfx", "TGLDIAG: seq=%u stage=%u addr=%06X value=%08X tpOn=%u tpOff=%u tpStatus=%08X mappedR=%u mappedW=%u",
+		self->diagnosticSequence, self->diagnosticStage, self->diagnosticAddress, self->diagnosticValue,
+		self->state.tpEnables, self->state.tpDisables, self->state.lastTpStatus,
+		self->state.mappedReads, self->state.mappedWrites);
+}
+
+void IGFX::TigerLakeRegisterMap::noteDiagnostic(uint32_t stage, uint32_t address, uint32_t value) {
+	if (!diagnosticEnabled || diagnosticCall == nullptr || diagnosticBudget == 0)
+		return;
+	// The hook only updates preallocated counters and queues a deferred call.
+	--diagnosticBudget;
+	++diagnosticSequence;
+	diagnosticStage = stage;
+	diagnosticAddress = address;
+	diagnosticValue = value;
+	thread_call_enter(diagnosticCall);
 }
 
 static uint32_t tglUptimeSeconds() {
@@ -1364,6 +1391,8 @@ void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint3
 			record(0xC8258, duty, true);
 			org(controller, 0xC8258, duty);
 		}
+		if (address == 0xC8258)
+			noteDiagnostic(out == 0 ? 7 : 8, address, out); // PWM duty off / on
 		lateCheck(controller);
 		return;
 	}
@@ -1377,6 +1406,8 @@ void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint3
 		state.mappedWrites++;
 		if (keep != 0)
 			org(controller, address, keep);
+		if (address == 0xC8258)
+			noteDiagnostic(8, address, keep); // firmware PWM duty retained
 		lateCheck(controller);
 		return;
 	}
@@ -1422,6 +1453,12 @@ void IGFX::TigerLakeRegisterMap::write(void *controller, uint32_t address, uint3
 	if ((translated || trace) && shouldLog())
 		SYSLOG("igfx", "TGLMAP: W %06X -> %06X = %08X (driver %08X)", address, mapped, out, value);
 	org(controller, mapped, out);
+	if (address == TGLReg::DpTpCtlA_ICL)
+		noteDiagnostic(!(out & TGLReg::Enable) ? 3 : ((out >> 8) & 7) == 3 ? 4 : 2, mapped, out);
+	else if (mapped == TGLReg::TransConfA)
+		noteDiagnostic(out & TGLReg::Enable ? 5 : 6, mapped, out);
+	else if (address == 0xC8258)
+		noteDiagnostic(out == 0 ? 7 : 8, address, out);
 
 	// Publish the state when link training ends either way: pattern bits 10:8 = 3 is "normal" (trained), disable is a failure or teardown
 	if (address == TGLReg::DpTpCtlA_ICL && (!(out & TGLReg::Enable) || ((out >> 8) & 7) == 3))
